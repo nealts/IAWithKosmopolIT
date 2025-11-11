@@ -6,13 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 
-/// <summary>
-/// Bridge WebSocket minimal : reçoit le numéro de bouton (1..6)
-/// Formats acceptés :
-///  - "1", "2", ... "6"
-///  - "btn 3", "pick 2"
-///  - JSON: {"btn":3} ou {"pick":2}
-/// </summary>
 public class KosmoInputBridge : MonoBehaviour
 {
     [Header("WebSocket")]
@@ -104,41 +97,77 @@ public class KosmoInputBridge : MonoBehaviour
     void Handle(string msg)
     {
         msg = msg.Trim();
-        int? btn = null;
+        // Debug.Log("[KosmoWS] " + msg);
 
-        // 1) JSON
+        // ---- JSON ? ----
         try
         {
-            var j = JsonUtility.FromJson<JsonWrap>(msg);
+            var j = JsonUtility.FromJson<JsonWrap>(EnsureJson(msg));
             if (j != null)
             {
-                if (j.btn > 0) btn = j.btn;
-                else if (j.pick > 0) btn = j.pick;
+                if (j.fail) { _main.Enqueue(() => gameManager?.OnOutcome(false, null)); return; }
+                if (j.success > 0) { int b = Mathf.Clamp(j.success, 1, 6); _main.Enqueue(() => gameManager?.OnOutcome(true, b)); return; }
+                if (j.son > 0) { _main.Enqueue(() => gameManager?.QueueNextSeries(j.son)); return; }
             }
         }
-        catch { /* on tentera le texte brut */ }
+        catch { /* ignore, essaie en texte */ }
 
-        // 2) Texte brut: "3" ou "btn 3" / "pick 2"
-        if (!btn.HasValue)
+        // ---- Texte brut ----
+        var lower = msg.ToLower();
+        // success 3 | success
+        if (lower.StartsWith("success"))
         {
-            var lower = msg.ToLower();
-            var parts = lower.Split(new[] { ' ', '\t', ':', ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 1 && int.TryParse(parts[0], out var n)) btn = n;
-            else if (parts.Length >= 2 && int.TryParse(parts[1], out var m)) btn = m;
+            int num = ExtractInt(lower);
+            if (num <= 0) num = 0; // pas obligatoire, on peut laisser null -> correctIndex
+            int? maybe = (num > 0) ? num : (int?)null;
+            _main.Enqueue(() => gameManager?.OnOutcome(true, maybe));
+            return;
         }
 
-        if (btn.HasValue)
+        // fail
+        if (lower.StartsWith("fail"))
         {
-            int oneBased = Mathf.Clamp(btn.Value, 1, 6);
-            _main.Enqueue(() => gameManager?.OnExternalSuccess(oneBased));
+            _main.Enqueue(() => gameManager?.OnOutcome(false, null));
+            return;
         }
-        else
+
+        // son 7
+        if (lower.StartsWith("son"))
         {
-            Debug.Log("[KosmoWS] Unknown msg: " + msg);
+            int n = ExtractInt(lower);
+            if (n > 0) _main.Enqueue(() => gameManager?.QueueNextSeries(n));
+            return;
         }
+
+        // optionnel: compat boutons "1..6" pour tests
+        if (int.TryParse(lower, out var btn) && btn >= 1 && btn <= 6)
+        {
+            _main.Enqueue(() => gameManager?.OnPick(btn - 1));
+            return;
+        }
+
+        Debug.Log("[KosmoWS] Unknown msg: " + msg);
     }
 
-    [Serializable] class JsonWrap { public int btn; public int pick; }
+    int ExtractInt(string s)
+    {
+        foreach (var tok in s.Split(' ', '\t', ':', ';', ','))
+            if (int.TryParse(tok, out var n)) return n;
+        return 0;
+    }
+
+    [Serializable] class JsonWrap { public bool fail; public int success; public int son; }
+
+    string EnsureJson(string s)
+    {
+        s = s.Trim();
+        if (s.StartsWith("{")) return s;
+        // Mini heuristique: transforme "success 3" en JSON simple
+        if (s.ToLower().StartsWith("success")) { var n = ExtractInt(s.ToLower()); return "{\"success\":" + n + "}"; }
+        if (s.ToLower().StartsWith("fail")) { return "{\"fail\":true}"; }
+        if (s.ToLower().StartsWith("son")) { var n = ExtractInt(s.ToLower()); return "{\"son\":" + n + "}"; }
+        return "{}";
+    }
 
     async Task CloseWS()
     {

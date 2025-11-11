@@ -6,6 +6,12 @@ using UnityEngine.UI;
 [DisallowMultipleComponent]
 public class MatrixRainController : MonoBehaviour
 {
+    [Header("Canvas sorting (put matrix behind everything)")]
+    [Tooltip("Create/force a local Canvas and set its sorting so the matrix renders behind your game UI.")]
+    public bool useOwnCanvas = true;
+    [Tooltip("Sorting order used if useOwnCanvas = true. Lower number = rendered behind.")]
+    public int sortingOrder = -50;               // << behind default UI (0)
+
     [Header("Zone")]
     [SerializeField] private RectTransform targetArea;          // Laisse vide -> prend le RectTransform du GameObject
     [SerializeField] private bool addRectMaskToClip = true;     // Ajoute automatiquement un RectMask2D
@@ -13,17 +19,12 @@ public class MatrixRainController : MonoBehaviour
     [Header("Police & rendu")]
     [SerializeField] private TMP_FontAsset fontAsset;
     [Min(6)] public int baseFontSize = 22;
-    [Tooltip("Espacement vertical entre deux glyphes (1 = collé)")]
     [Range(0.8f, 1.6f)] public float lineSpacing = 1.05f;
-    [Tooltip("Largeur d'une colonne en pixels (≈ largeur du glyphe)")]
     [Min(8f)] public float columnWidth = 18f;
-    [Tooltip("Marge latérale intérieure en pixels")]
     public float sidePadding = 8f;
 
     [Header("Colonnes")]
-    [Tooltip("Nombre de colonnes. 0 = auto selon la largeur")]
     public int columns = 0;
-    [Tooltip("Nombre maximum de colonnes si 'auto'")]
     [Min(1)] public int maxColumnsAuto = 160;
 
     [Header("Vitesses & longueurs")]
@@ -35,11 +36,8 @@ public class MatrixRainController : MonoBehaviour
     public Color tailColor = new Color(0.0f, 0.9f, 0.3f, 0.35f);
 
     [Header("Comportement")]
-    [Tooltip("Fréquence de rafraîchissement des caractères de chaque colonne")]
     [Range(0.02f, 0.5f)] public float charRefreshInterval = 0.06f;
-    [Tooltip("Taux de randomisation partielle (0 = fixe, 1 = remplace tout à chaque tick)")]
     [Range(0f, 1f)] public float shuffleRatio = 0.35f;
-    [Tooltip("Décaler les vitesses pour éviter l'uniformité")]
     public bool desync = true;
 
     [Header("Jeu de caractères")]
@@ -53,6 +51,16 @@ public class MatrixRainController : MonoBehaviour
 
     void Awake()
     {
+        // Force a local Canvas with low sorting order so this effect goes behind the rest.
+        if (useOwnCanvas)
+        {
+            var cv = GetComponent<Canvas>();
+            if (!cv) cv = gameObject.AddComponent<Canvas>();
+            cv.overrideSorting = true;
+            cv.sortingOrder = sortingOrder;   // lower = behind
+            // keep the same render mode as parent (Unity auto-inherits from root)
+        }
+
         rt = GetComponent<RectTransform>();
         if (!targetArea) targetArea = rt;
 
@@ -60,45 +68,30 @@ public class MatrixRainController : MonoBehaviour
             gameObject.AddComponent<RectMask2D>();
 
         if (fontAsset == null)
-        {
             Debug.LogWarning("MatrixRainController: aucun TMP_FontAsset défini, je prends la police par défaut.");
-        }
 
         Build();
     }
 
-    void OnEnable()
-    {
-        foreach (var c in pool) if (c) c.enabled = true;
-    }
-
-    void OnDisable()
-    {
-        foreach (var c in pool) if (c) c.enabled = false;
-    }
+    void OnEnable() { foreach (var c in pool) if (c) c.enabled = true; }
+    void OnDisable() { foreach (var c in pool) if (c) c.enabled = false; }
 
     void OnDestroy()
     {
-        foreach (var c in pool)
-        {
-            if (c) Destroy(c.gameObject);
-        }
+        foreach (var c in pool) if (c) Destroy(c.gameObject);
         pool.Clear();
     }
 
     [ContextMenu("Rebuild")]
     public void Build()
     {
-        // nettoyage
         foreach (var c in pool) if (c) Destroy(c.gameObject);
         pool.Clear();
 
-        // calculs géométrie
         var areaWidth = targetArea.rect.width - sidePadding * 2f;
         pixelPerLine = baseFontSize * lineSpacing;
 
         int colCount = columns > 0 ? columns : Mathf.Clamp(Mathf.FloorToInt(areaWidth / columnWidth), 1, maxColumnsAuto);
-
         float x0 = -targetArea.rect.width * 0.5f + sidePadding + columnWidth * 0.5f;
 
         for (int i = 0; i < colCount; i++)
@@ -117,7 +110,7 @@ public class MatrixRainController : MonoBehaviour
         var r = go.GetComponent<RectTransform>();
         r.anchorMin = r.anchorMax = new Vector2(0.5f, 0.5f);
         r.pivot = new Vector2(0.5f, 0.5f);
-        r.sizeDelta = new Vector2(columnWidth, targetArea.rect.height + 200f); // un peu plus haut pour spawner offscreen
+        r.sizeDelta = new Vector2(columnWidth, targetArea.rect.height + 200f);
         r.anchoredPosition = new Vector2(localX, Random.Range(50f, targetArea.rect.height * 0.5f));
 
         var tmpGo = new GameObject("TMP", typeof(TextMeshProUGUI));
@@ -127,11 +120,11 @@ public class MatrixRainController : MonoBehaviour
         if (fontAsset) tmp.font = fontAsset;
         tmp.fontSize = baseFontSize;
         tmp.enableWordWrapping = false;
-        tmp.overflowMode = TextOverflowModes.Overflow;   // (optionnel) évite la coupure
+        tmp.overflowMode = TextOverflowModes.Overflow;
         tmp.alignment = TextAlignmentOptions.Top;
         tmp.raycastTarget = false;
         tmp.margin = new Vector4(0, 0, 0, 0);
-        tmp.richText = true; // on colore chaque char
+        tmp.richText = true;
         tmp.text = "";
 
         var tmpRt = tmp.GetComponent<RectTransform>();
@@ -141,24 +134,12 @@ public class MatrixRainController : MonoBehaviour
         tmpRt.anchoredPosition = Vector2.zero;
 
         var col = go.AddComponent<MatrixColumn>();
-        col.Setup(
-            tmp,
-            targetArea,
-            charset,
-            lengthRange,
-            speedRange,
-            charRefreshInterval,
-            shuffleRatio,
-            headColor,
-            tailColor,
-            pixelPerLine,
-            desync
-        );
-
+        col.Setup(tmp, targetArea, charset, lengthRange, speedRange,
+                  charRefreshInterval, shuffleRatio, headColor, tailColor,
+                  pixelPerLine, desync);
         return col;
     }
 
-    // Appelle ça si tu modifies des paramètres en Play (ex: couleurs, vitesse)
     public void ApplyRuntime()
     {
         foreach (var c in pool) if (c) c.ApplyRuntime(headColor, tailColor, charRefreshInterval, shuffleRatio);
