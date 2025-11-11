@@ -4536,7 +4536,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 41c67a3ccbebcc248b4cff2faa4d8db9, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::KosmoNodeRedBridge
-  wsUrl: ws://192.168.1.3:1880/ws/kosmo
+  wsUrl: ws://192.168.1.2:1880/ws/kosmo
   autoReconnect: 1
   reconnectDelaySec: 2
   game: {fileID: 0}
@@ -7582,7 +7582,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: c37a4db66e45aa14c983deb4f282c149, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::WSProgressBridge
-  wsUrl: ws://192.168.1.3:1880/ws/dna
+  wsUrl: ws://192.168.1.2:1880/ws/dna
   autoReconnect: 1
   reconnectDelaySec: 3
   animator: {fileID: 38118251}
