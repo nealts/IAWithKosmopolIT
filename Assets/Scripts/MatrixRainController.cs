@@ -44,7 +44,7 @@ public class MatrixRainController : MonoBehaviour
 
     [Header("Jeu de caractères")]
     [TextArea(1, 3)]
-    public string charset = "01 2345 6789 ABCDEF ";
+    public string charset = "0123456789 ";
 
     // --- internes ---
     private RectTransform rt;
