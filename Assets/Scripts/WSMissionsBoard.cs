@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using TMPro;
@@ -11,11 +12,15 @@ using UnityEngine;
 
 public class WSMissionsBoard : MonoBehaviour
 {
-    [Header("WebSocket")]
+    [Header("WebSocket – Commands (start/done/reset) + outbound")]
     [Tooltip("Ex: ws://127.0.0.1:1880/ws/missions")]
     public string wsUrl = "ws://127.0.0.1:1880/ws/missions";
     public bool autoReconnect = true;
     public float reconnectDelaySec = 3f;
+
+    [Header("WebSocket – IA (runtime params)")]
+    [Tooltip("Ex: ws://127.0.0.1:1880/ws/ia")]
+    public string wsUrlIa = "ws://127.0.0.1:1880/ws/ia";
 
     [Header("UI - Réparations en cours (4 slots max dans la scène)")]
     public TextMeshProUGUI[] ongoingSlots = new TextMeshProUGUI[4];
@@ -34,15 +39,21 @@ public class WSMissionsBoard : MonoBehaviour
     public bool logMessages = true;
 
     // Etat
-    readonly List<string> _active = new List<string>(4);          // visibles
+    readonly List<string> _active = new List<string>(4);          // visibles (ordre d’affichage)
     readonly Queue<string> _queue = new Queue<string>();          // en attente
     readonly LinkedList<string> _done = new LinkedList<string>(); // terminées (tête = plus récent)
     const int MaxDone = 6;
 
-    // WS infra
+    // WS infra (commands/outbound)
     ClientWebSocket _ws;
     CancellationTokenSource _cts;
     Task _recvTask;
+
+    // WS infra (IA)
+    ClientWebSocket _wsIa;
+    CancellationTokenSource _ctsIa;
+    Task _recvTaskIa;
+
     bool _closing;
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
 
@@ -62,7 +73,8 @@ public class WSMissionsBoard : MonoBehaviour
             if (r) r.SetActive(false);
         }
 
-        Connect();
+        ConnectCmd();
+        ConnectIa();
     }
 
     void Update()
@@ -70,7 +82,7 @@ public class WSMissionsBoard : MonoBehaviour
         while (_main.TryDequeue(out var a)) a?.Invoke();
     }
 
-    void OnApplicationQuit() => _ = CloseWS();
+    void OnApplicationQuit() => _ = CloseAllWS();
 
     [ContextMenu("Reset Board")]
     public void ResetBoard()
@@ -86,7 +98,7 @@ public class WSMissionsBoard : MonoBehaviour
     {
         if (!t) return null;
         var p = t.transform.parent as RectTransform;
-        return p ? p.gameObject : t.gameObject; // parent (image + deco) si présent, sinon le TMP lui-même
+        return p ? p.gameObject : t.gameObject; // parent (image + déco) si présent, sinon le TMP lui-même
     }
 
     void ClearAllUI()
@@ -137,29 +149,29 @@ public class WSMissionsBoard : MonoBehaviour
 
     string TitleOf(string id) => missions.FirstOrDefault(m => m.id == id)?.title ?? id;
 
-    // ---------- WebSocket ----------
-    async void Connect()
+    // ---------- WebSocket (commands/outbound) ----------
+    async void ConnectCmd()
     {
-        await CloseWS();
+        await CloseWS(_ws, _cts, _recvTask);
+        _ws = null; _cts = null; _recvTask = null;
+
         _ws = new ClientWebSocket();
         _cts = new CancellationTokenSource();
         try
         {
-            if (logMessages) Debug.Log("[WS] Connecting " + wsUrl);
+            if (logMessages) Debug.Log("[WS-cmd] Connecting " + wsUrl);
             await _ws.ConnectAsync(new Uri(wsUrl), _cts.Token);
-            if (logMessages) Debug.Log("[WS] Connected");
-            _recvTask = Task.Run(RecvLoop);
+            if (logMessages) Debug.Log("[WS-cmd] Connected");
+            _recvTask = Task.Run(RecvLoopCmd);
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[WS] Connect failed: " + e.Message);
-            if (autoReconnect) Invoke(nameof(RetryConnect), reconnectDelaySec);
+            Debug.LogWarning("[WS-cmd] Connect failed: " + e.Message);
+            if (autoReconnect) Invoke(nameof(ConnectCmd), reconnectDelaySec);
         }
     }
 
-    void RetryConnect() { if (!_closing) Connect(); }
-
-    async Task RecvLoop()
+    async Task RecvLoopCmd()
     {
         var buf = new ArraySegment<byte>(new byte[4096]);
         while (_ws != null && _ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
@@ -180,36 +192,107 @@ public class WSMissionsBoard : MonoBehaviour
                 } while (!res.EndOfMessage);
 
                 var msg = Encoding.UTF8.GetString(ms.ToArray());
-                HandleMessage(msg);
+                HandleCmdMessage(msg);
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[WS] Recv error: " + e.Message);
+                Debug.LogWarning("[WS-cmd] Recv error: " + e.Message);
                 break;
             }
             finally { ms.Dispose(); }
         }
-        if (!_closing && autoReconnect) _main.Enqueue(() => Invoke(nameof(RetryConnect), reconnectDelaySec));
+        if (autoReconnect && !_closing) _main.Enqueue(() => Invoke(nameof(ConnectCmd), reconnectDelaySec));
     }
 
-    async Task CloseWS()
+    // ---------- WebSocket (IA / params runtime) ----------
+    async void ConnectIa()
+    {
+        await CloseWS(_wsIa, _ctsIa, _recvTaskIa);
+        _wsIa = null; _ctsIa = null; _recvTaskIa = null;
+
+        _wsIa = new ClientWebSocket();
+        _ctsIa = new CancellationTokenSource();
+        try
+        {
+            if (logMessages) Debug.Log("[WS-ia] Connecting " + wsUrlIa);
+            await _wsIa.ConnectAsync(new Uri(wsUrlIa), _ctsIa.Token);
+            if (logMessages) Debug.Log("[WS-ia] Connected");
+            _recvTaskIa = Task.Run(RecvLoopIa);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[WS-ia] Connect failed: " + e.Message);
+            if (autoReconnect) Invoke(nameof(ConnectIa), reconnectDelaySec);
+        }
+    }
+
+    async Task RecvLoopIa()
+    {
+        var buf = new ArraySegment<byte>(new byte[4096]);
+        while (_wsIa != null && _wsIa.State == WebSocketState.Open && !_ctsIa.IsCancellationRequested)
+        {
+            WebSocketReceiveResult res = null;
+            var ms = new System.IO.MemoryStream();
+            try
+            {
+                do
+                {
+                    res = await _wsIa.ReceiveAsync(buf, _ctsIa.Token);
+                    if (res.MessageType == WebSocketMessageType.Close)
+                    {
+                        await _wsIa.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", _ctsIa.Token);
+                        break;
+                    }
+                    ms.Write(buf.Array, buf.Offset, res.Count);
+                } while (!res.EndOfMessage);
+
+                var msg = Encoding.UTF8.GetString(ms.ToArray());
+                HandleIaMessage(msg);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[WS-ia] Recv error: " + e.Message);
+                break;
+            }
+            finally { ms.Dispose(); }
+        }
+        if (autoReconnect && !_closing) _main.Enqueue(() => Invoke(nameof(ConnectIa), reconnectDelaySec));
+    }
+
+    // ---------- Fermeture WS (sans ref) ----------
+    private async Task CloseWS(ClientWebSocket ws, CancellationTokenSource cts, Task recv)
     {
         try
         {
-            _closing = true;
-            _cts?.Cancel();
-            if (_ws != null)
+            cts?.Cancel();
+            if (ws != null)
             {
-                if (_ws.State == WebSocketState.Open)
-                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None);
-                _ws.Dispose();
+                if (ws.State == WebSocketState.Open)
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None);
+                ws.Dispose();
+            }
+            if (recv != null)
+            {
+                try { await Task.WhenAny(recv, Task.Delay(50)); } catch { /* ignore */ }
             }
         }
-        catch { }
-        finally { _ws = null; _cts = null; _recvTask = null; _closing = false; }
+        catch { /* ignore */ }
     }
 
-    // ---------- Envoi ----------
+    private async Task CloseAllWS()
+    {
+        _closing = true;
+
+        await CloseWS(_ws, _cts, _recvTask);
+        _ws = null; _cts = null; _recvTask = null;
+
+        await CloseWS(_wsIa, _ctsIa, _recvTaskIa);
+        _wsIa = null; _ctsIa = null; _recvTaskIa = null;
+
+        _closing = false;
+    }
+
+    // ---------- Envoi vers wsUrl (missions) ----------
     async Task SendTextAsync(string text)
     {
         try
@@ -218,22 +301,22 @@ public class WSMissionsBoard : MonoBehaviour
             {
                 var seg = new ArraySegment<byte>(Encoding.UTF8.GetBytes(text));
                 await _ws.SendAsync(seg, WebSocketMessageType.Text, true, CancellationToken.None);
-                if (logMessages) Debug.Log("[WS] => " + text);
+                if (logMessages) Debug.Log("[WS-out] => " + text);
             }
-            else if (logMessages) Debug.LogWarning("[WS] send skipped (not connected): " + text);
+            else if (logMessages) Debug.LogWarning("[WS-out] skipped (not connected): " + text);
         }
-        catch (Exception e) { Debug.LogWarning("[WS] send failed: " + e.Message); }
+        catch (Exception e) { Debug.LogWarning("[WS-out] send failed: " + e.Message); }
     }
 
-    // ---------- Parsing protocole v1 ----------
+    // ---------- Parsing protocole v1 (commands) ----------
     [Serializable] class Cmd { public string cmd; public string mission; public string id; }
 
-    void HandleMessage(string raw)
+    void HandleCmdMessage(string raw)
     {
-        if (logMessages) Debug.Log("[WS] <= " + raw);
+        if (logMessages) Debug.Log("[WS-cmd] <= " + raw);
 
-        string intent = null; // "start" | "done" | "reset"
-        string token = null; // slug ou id
+        string intent = null; // start|done|reset
+        string token = null;
 
         // JSON strict
         try
@@ -265,43 +348,76 @@ public class WSMissionsBoard : MonoBehaviour
                 case "reset": ResetBoard(); break;
                 case "start":
                     if (TryResolveMissionId(token, out var idStart)) StartMission(idStart);
-                    else Debug.LogWarning("[WS] start: mission introuvable pour token='" + token + "'");
+                    else Debug.LogWarning("[WS-cmd] start: mission introuvable pour token='" + token + "'");
                     break;
                 case "done":
                     if (TryResolveMissionId(token, out var idDone)) CompleteMission(idDone);
-                    else Debug.LogWarning("[WS] done: mission introuvable pour token='" + token + "'");
+                    else Debug.LogWarning("[WS-cmd] done: mission introuvable pour token='" + token + "'");
                     break;
                 default:
-                    Debug.Log("[WS] Message ignoré (format invalide)."); break;
+                    Debug.Log("[WS-cmd] Message ignoré (format invalide)."); break;
             }
         });
     }
 
+    // ---------- Parsing IA (Visible Active Slots N) ----------
+    [Serializable] class IaJson { public int visibleActiveSlots; public string cmd; public int value; }
+
+    void HandleIaMessage(string raw)
+    {
+        if (logMessages) Debug.Log("[WS-ia] <= " + raw);
+        var s = raw.Trim().ToLowerInvariant();
+        int n = 0;
+
+        // JSON toléré
+        if (s.StartsWith("{"))
+        {
+            try
+            {
+                var j = JsonUtility.FromJson<IaJson>(raw);
+                if (j != null)
+                {
+                    if (j.visibleActiveSlots > 0) n = j.visibleActiveSlots;
+                    else if ((j.cmd ?? "").ToLowerInvariant().Contains("visible")) n = j.value;
+                }
+            }
+            catch { }
+        }
+
+        // Texte : “Visible Active Slots 3”
+        if (n == 0 && s.Contains("visible") && s.Contains("slot"))
+        {
+            var m = Regex.Match(s, @"\d+");
+            if (m.Success) int.TryParse(m.Value, out n);
+        }
+
+        if (n >= 2 && n <= 4)
+            _main.Enqueue(() => ChangeVisibleSlots(n));
+    }
+
+    // ---------- Résolution / moteur ----------
     bool TryResolveMissionId(string token, out string id)
     {
         id = null;
         if (string.IsNullOrWhiteSpace(token)) return false;
 
-        // id direct ?
         var t = token.Trim();
         var byId = missions.FirstOrDefault(m => string.Equals(m.id, t, StringComparison.OrdinalIgnoreCase));
         if (byId != null) { id = byId.id; return true; }
 
-        // match slug / titre
         foreach (var m in missions)
             if (Slug(m.title) == Slug(t) || Slug(m.startAlias) == Slug(t)) { id = m.id; return true; }
 
         return false;
     }
 
-    // ---------- Moteur ----------
     List<string> VisibleActiveSnapshot() => _active.Take(visibleActiveSlots).ToList();
 
     async void NotifyNewlyVisible(List<string> prev, List<string> now)
     {
         foreach (var id in now)
             if (!prev.Contains(id))
-                await SendTextAsync(OutMessageFor(id));   // seulement quand ça devient visible
+                await SendTextAsync(OutMessageFor(id));   // ok si doublon, demandé
     }
 
     string OutMessageFor(string id)
@@ -309,6 +425,34 @@ public class WSMissionsBoard : MonoBehaviour
         var m = missions.FirstOrDefault(x => x.id == id);
         if (m == null) return "Mission ?";
         return string.IsNullOrWhiteSpace(m.outMessage) ? $"Mission {m.number}" : m.outMessage;
+    }
+
+    void ChangeVisibleSlots(int newCount)
+    {
+        int maxSlotsInScene = Mathf.Clamp(ongoingSlots?.Length ?? 0, 2, 4);
+        newCount = Mathf.Clamp(newCount, 2, maxSlotsInScene);
+
+        var prevVisible = VisibleActiveSnapshot();
+        visibleActiveSlots = newCount;
+
+        // si on augmente la capacité, remplir depuis la queue
+        while (_active.Count < visibleActiveSlots && _queue.Count > 0)
+            _active.Add(_queue.Dequeue());
+
+        // ON/OFF des racines au-dessus/la-dessous du cap
+        for (int i = 0; i < (ongoingSlots?.Length ?? 0); i++)
+        {
+            var root = SlotRoot(ongoingSlots[i]);
+            if (!root) continue;
+            bool show = (i < visibleActiveSlots) && (i < _active.Count);
+            if (root.activeSelf != show) root.SetActive(show);
+        }
+
+        var nowVisible = VisibleActiveSnapshot();
+        _ = Task.Run(() => NotifyNewlyVisible(prevVisible, nowVisible));
+
+        UpdateUI();
+        if (logMessages) Debug.Log($"[IA] visibleActiveSlots = {visibleActiveSlots}");
     }
 
     void StartMission(string id)
