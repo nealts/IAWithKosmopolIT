@@ -13,13 +13,11 @@ using UnityEngine;
 public class WSMissionsBoard : MonoBehaviour
 {
     [Header("WebSocket – Commands (start/done/reset) + outbound")]
-    [Tooltip("Ex: ws://127.0.0.1:1880/ws/missions")]
     public string wsUrl = "ws://127.0.0.1:1880/ws/missions";
     public bool autoReconnect = true;
     public float reconnectDelaySec = 3f;
 
-    [Header("WebSocket – IA (runtime params)")]
-    [Tooltip("Ex: ws://127.0.0.1:1880/ws/ia")]
+    [Header("WebSocket – IA (runtime params & mission states)")]
     public string wsUrlIa = "ws://127.0.0.1:1880/ws/ia";
 
     [Header("UI - Réparations en cours (4 slots max dans la scène)")]
@@ -29,7 +27,6 @@ public class WSMissionsBoard : MonoBehaviour
     public TextMeshProUGUI[] doneSlots = new TextMeshProUGUI[6];
 
     [Header("Affichage")]
-    [Tooltip("Nombre de missions affichées simultanément (2..4)")]
     [Range(2, 4)] public int visibleActiveSlots = 4;
 
     [Header("Catalogue de missions")]
@@ -38,18 +35,31 @@ public class WSMissionsBoard : MonoBehaviour
     [Header("Debug")]
     public bool logMessages = true;
 
-    // Etat
-    readonly List<string> _active = new List<string>(4);          // visibles (ordre d’affichage)
-    readonly Queue<string> _queue = new Queue<string>();          // en attente
-    readonly LinkedList<string> _done = new LinkedList<string>(); // terminées (tête = plus récent)
+    enum RunState { Idle, Running, Done }
+
+    [Serializable]
+    class MissionRuntime
+    {
+        public string id;
+        public int number;
+        public bool active = true;
+        public int phase = 0;          // 0 = Phase 1, 1 = Phase 2
+        public RunState run = RunState.Idle;
+    }
+
+    Dictionary<string, MissionRuntime> _rt = new Dictionary<string, MissionRuntime>();
+
+    readonly List<string> _active = new List<string>(4);   // ids visibles (ordre)
+    readonly Queue<string> _queue = new Queue<string>();   // ids en attente (phase courante ONLY)
+    readonly LinkedList<string> _done = new LinkedList<string>();
     const int MaxDone = 6;
 
-    // WS infra (commands/outbound)
+    int _currentPhase = 0; // 0 = P1, 1 = P2
+
     ClientWebSocket _ws;
     CancellationTokenSource _cts;
     Task _recvTask;
 
-    // WS infra (IA)
     ClientWebSocket _wsIa;
     CancellationTokenSource _ctsIa;
     Task _recvTaskIa;
@@ -57,25 +67,51 @@ public class WSMissionsBoard : MonoBehaviour
     bool _closing;
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
 
-    // ---------- Unity ----------
     void Start()
     {
-        // clamp par sécurité selon les slots réellement assignés
         int maxSlotsInScene = Mathf.Clamp(ongoingSlots?.Length ?? 0, 2, 4);
         visibleActiveSlots = Mathf.Clamp(visibleActiveSlots, 2, maxSlotsInScene);
 
+        InitRuntimeDefaults();
         ClearAllUI();
 
-        // force OFF les slots au-delà de la capacité choisie (ex: 2 => cache 3 & 4)
         for (int i = visibleActiveSlots; i < (ongoingSlots?.Length ?? 0); i++)
         {
             var r = SlotRoot(ongoingSlots[i]);
             if (r) r.SetActive(false);
         }
 
+        RebuildFromRuntime(); // construit _active/_queue pour la phase courante
+
         ConnectCmd();
         ConnectIa();
     }
+
+    // Initialise l'état runtime par défaut : 10 missions en Phase 1, le reste en Phase 2.
+    void InitRuntimeDefaults()
+    {
+        _rt.Clear();
+        for (int i = 0; i < missions.Length; i++)
+        {
+            var def = missions[i];
+            bool active;
+            int phase;
+
+            if (i < 5) { active = true; phase = 0; } // Phase 1
+            else if (i < 10) { active = true; phase = 1; } // Phase 2
+            else { active = false; phase = 0; } // désactivées
+
+            _rt[def.id] = new MissionRuntime
+            {
+                id = def.id,
+                number = def.number,
+                active = active,
+                phase = phase,
+                run = RunState.Idle
+            };
+        }
+    }
+
 
     void Update()
     {
@@ -87,18 +123,22 @@ public class WSMissionsBoard : MonoBehaviour
     [ContextMenu("Reset Board")]
     public void ResetBoard()
     {
+        foreach (var r in _rt.Values)
+            if (r.run != RunState.Done) r.run = RunState.Idle;
+
         _active.Clear();
         _queue.Clear();
         _done.Clear();
-        UpdateUI();
+
+        RebuildFromRuntime();
     }
 
-    // ---------- Helpers UI ----------
+    // ---------- UI ----------
     GameObject SlotRoot(TextMeshProUGUI t)
     {
         if (!t) return null;
         var p = t.transform.parent as RectTransform;
-        return p ? p.gameObject : t.gameObject; // parent (image + déco) si présent, sinon le TMP lui-même
+        return p ? p.gameObject : t.gameObject;
     }
 
     void ClearAllUI()
@@ -121,7 +161,6 @@ public class WSMissionsBoard : MonoBehaviour
 
     void UpdateUI()
     {
-        // En cours — n’affiche que jusqu’à visibleActiveSlots
         for (int i = 0; i < ongoingSlots.Length; i++)
         {
             var t = ongoingSlots[i];
@@ -133,7 +172,6 @@ public class WSMissionsBoard : MonoBehaviour
             t.text = show ? TitleOf(_active[i]) : "";
         }
 
-        // Terminées (plus récent en haut)
         var doneArr = _done.ToArray();
         for (int i = 0; i < doneSlots.Length; i++)
         {
@@ -148,6 +186,67 @@ public class WSMissionsBoard : MonoBehaviour
     }
 
     string TitleOf(string id) => missions.FirstOrDefault(m => m.id == id)?.title ?? id;
+
+    // ---------- Runtime build / guards ----------
+    bool IsEligibleNow(string id)
+    {
+        if (!_rt.TryGetValue(id, out var r)) return false;
+        return r.active && r.phase == _currentPhase && r.run != RunState.Done;
+    }
+
+    void PurgeQueueForCurrentPhase()
+    {
+        if (_queue.Count == 0) return;
+        var tmp = _queue.ToArray().ToList();
+        tmp.RemoveAll(id => !IsEligibleNow(id));
+        _queue.Clear();
+        foreach (var id in tmp) _queue.Enqueue(id);
+    }
+
+    void RefillActiveFromQueue()
+    {
+        PurgeQueueForCurrentPhase();
+        while (_active.Count < visibleActiveSlots && _queue.Count > 0)
+        {
+            var next = _queue.Dequeue();
+            if (!IsEligibleNow(next)) { _rt[next].run = RunState.Idle; continue; }
+            _active.Add(next);
+            _rt[next].run = RunState.Running;
+        }
+    }
+
+    void RebuildFromRuntime()
+    {
+        var prevVisible = VisibleActiveSnapshot();
+
+        _active.Clear();
+        _queue.Clear();
+
+        // Eligible uniquement pour la phase courante
+        var eligible = missions
+            .Select(m => _rt[m.id])
+            .Where(r => r.phase == _currentPhase && r.active && r.run != RunState.Done)
+            .OrderBy(r => r.number)
+            .ToList();
+
+        foreach (var r in eligible)
+        {
+            if (_active.Count < visibleActiveSlots) { _active.Add(r.id); r.run = RunState.Running; }
+            else _queue.Enqueue(r.id); // queue ne contient QUE la phase courante
+        }
+
+        // Ce qui n’est ni visible ni en queue redevient Idle (hors Done)
+        foreach (var r in _rt.Values)
+        {
+            if (r.run == RunState.Done) continue;
+            if (!_active.Contains(r.id) && !_queue.Contains(r.id)) r.run = RunState.Idle;
+        }
+
+        var nowVisible = VisibleActiveSnapshot();
+        _ = Task.Run(() => NotifyNewlyVisible(prevVisible, nowVisible));
+
+        UpdateUI();
+    }
 
     // ---------- WebSocket (commands/outbound) ----------
     async void ConnectCmd()
@@ -204,7 +303,7 @@ public class WSMissionsBoard : MonoBehaviour
         if (autoReconnect && !_closing) _main.Enqueue(() => Invoke(nameof(ConnectCmd), reconnectDelaySec));
     }
 
-    // ---------- WebSocket (IA / params runtime) ----------
+    // ---------- WebSocket (IA / params + états mission) ----------
     async void ConnectIa()
     {
         await CloseWS(_wsIa, _ctsIa, _recvTaskIa);
@@ -259,7 +358,6 @@ public class WSMissionsBoard : MonoBehaviour
         if (autoReconnect && !_closing) _main.Enqueue(() => Invoke(nameof(ConnectIa), reconnectDelaySec));
     }
 
-    // ---------- Fermeture WS (sans ref) ----------
     private async Task CloseWS(ClientWebSocket ws, CancellationTokenSource cts, Task recv)
     {
         try
@@ -273,10 +371,10 @@ public class WSMissionsBoard : MonoBehaviour
             }
             if (recv != null)
             {
-                try { await Task.WhenAny(recv, Task.Delay(50)); } catch { /* ignore */ }
+                try { await Task.WhenAny(recv, Task.Delay(50)); } catch { }
             }
         }
-        catch { /* ignore */ }
+        catch { }
     }
 
     private async Task CloseAllWS()
@@ -292,7 +390,6 @@ public class WSMissionsBoard : MonoBehaviour
         _closing = false;
     }
 
-    // ---------- Envoi vers wsUrl (missions) ----------
     async Task SendTextAsync(string text)
     {
         try
@@ -308,7 +405,6 @@ public class WSMissionsBoard : MonoBehaviour
         catch (Exception e) { Debug.LogWarning("[WS-out] send failed: " + e.Message); }
     }
 
-    // ---------- Parsing protocole v1 (commands) ----------
     [Serializable] class Cmd { public string cmd; public string mission; public string id; }
 
     void HandleCmdMessage(string raw)
@@ -318,7 +414,6 @@ public class WSMissionsBoard : MonoBehaviour
         string intent = null; // start|done|reset
         string token = null;
 
-        // JSON strict
         try
         {
             var j = JsonUtility.FromJson<Cmd>(raw);
@@ -331,14 +426,12 @@ public class WSMissionsBoard : MonoBehaviour
         }
         catch { }
 
-        // Texte strict
         if (intent == null)
         {
-            var s = raw.Trim();
-            var lower = s.ToLowerInvariant();
-            if (lower == "reset") intent = "reset";
-            else if (lower.StartsWith("start ")) { intent = "start"; token = s.Substring(6).Trim(); }
-            else if (lower.StartsWith("done ")) { intent = "done"; token = s.Substring(5).Trim(); }
+            var s = raw.Trim().ToLowerInvariant();
+            if (s == "reset") intent = "reset";
+            else if (s.StartsWith("start ")) { intent = "start"; token = raw.Substring(6).Trim(); }
+            else if (s.StartsWith("done ")) { intent = "done"; token = raw.Substring(5).Trim(); }
         }
 
         _main.Enqueue(() =>
@@ -360,53 +453,154 @@ public class WSMissionsBoard : MonoBehaviour
         });
     }
 
-    // ---------- Parsing IA (Visible Active Slots N) ----------
-    [Serializable] class IaJson { public int visibleActiveSlots; public string cmd; public int value; }
+    [Serializable]
+    class IaJson
+    {
+        public int visibleActiveSlots;
+        public string cmd;
+        public int value;
+        public int ID;
+        public int Active;
+        public int Phase;
+        public int startPhase;
+    }
 
     void HandleIaMessage(string raw)
     {
         if (logMessages) Debug.Log("[WS-ia] <= " + raw);
-        var s = raw.Trim().ToLowerInvariant();
-        int n = 0;
+        var s = raw.Trim();
 
-        // JSON toléré
         if (s.StartsWith("{"))
         {
             try
             {
-                var j = JsonUtility.FromJson<IaJson>(raw);
+                var j = JsonUtility.FromJson<IaJson>(s);
                 if (j != null)
                 {
-                    if (j.visibleActiveSlots > 0) n = j.visibleActiveSlots;
-                    else if ((j.cmd ?? "").ToLowerInvariant().Contains("visible")) n = j.value;
+                    if (j.visibleActiveSlots >= 2 && j.visibleActiveSlots <= 4)
+                    { _main.Enqueue(() => ChangeVisibleSlots(j.visibleActiveSlots)); return; }
+
+                    if (!string.IsNullOrEmpty(j.cmd))
+                    {
+                        var c = j.cmd.ToLowerInvariant();
+                        if (c.Contains("visible"))
+                        { _main.Enqueue(() => ChangeVisibleSlots(Mathf.Clamp(j.value, 2, 4))); return; }
+
+                        if (c.Contains("startphase"))
+                        { _main.Enqueue(() => BeginPhase(Mathf.Clamp(j.value, 0, 1))); return; }
+                    }
+
+                    if (j.startPhase == 0 || j.startPhase == 1)
+                    { _main.Enqueue(() => BeginPhase(j.startPhase)); return; }
+
+                    if (j.ID > 0)
+                    {
+                        int idNum = j.ID;
+                        int? act = (j.Active == 0 || j.Active == 1) ? j.Active : (int?)null;
+                        int? ph = (j.Phase == 0 || j.Phase == 1) ? j.Phase : (int?)null;
+                        _main.Enqueue(() => ApplyMissionUpdateFromNode(idNum, act, ph));
+                        return;
+                    }
                 }
             }
             catch { }
         }
 
-        // Texte : “Visible Active Slots 3”
-        if (n == 0 && s.Contains("visible") && s.Contains("slot"))
+        var lower = s.ToLowerInvariant();
+        if (lower.Contains("visible") && lower.Contains("slot"))
         {
-            var m = Regex.Match(s, @"\d+");
-            if (m.Success) int.TryParse(m.Value, out n);
+            var m = Regex.Match(lower, @"\d+");
+            if (m.Success && int.TryParse(m.Value, out var n))
+            { _main.Enqueue(() => ChangeVisibleSlots(Mathf.Clamp(n, 2, 4))); return; }
         }
 
-        if (n >= 2 && n <= 4)
-            _main.Enqueue(() => ChangeVisibleSlots(n));
+        if (lower.Contains("start") && lower.Contains("phase"))
+        {
+            var m = Regex.Match(lower, @"\d+");
+            if (m.Success && int.TryParse(m.Value, out var p))
+            { _main.Enqueue(() => BeginPhase(Mathf.Clamp(p - 1, 0, 1))); return; }
+        }
+
+        if (lower.StartsWith("mission/"))
+        {
+            var parts = lower.Split(new[] { ' ', '\t' });
+            var topic = parts[0];
+            var numMatch = Regex.Match(topic, @"mission/(\d+)/");
+            if (numMatch.Success && int.TryParse(numMatch.Groups[1].Value, out var idNum))
+            {
+                int? act = null, ph = null;
+                if (topic.EndsWith("/active"))
+                    act = (parts.Length > 1 && int.TryParse(parts[1], out var a)) ? a : 1;
+                else if (topic.EndsWith("/phase"))
+                    ph = (parts.Length > 1 && int.TryParse(parts[1], out var p2)) ? p2 : 0;
+
+                _main.Enqueue(() => ApplyMissionUpdateFromNode(idNum, act, ph));
+                return;
+            }
+        }
     }
 
-    // ---------- Résolution / moteur ----------
+    // ---------- Engine ----------
+    void BeginPhase(int phase01)
+    {
+        _currentPhase = Mathf.Clamp(phase01, 0, 1);
+        if (logMessages) Debug.Log($"[PHASE] Start Phase {(_currentPhase + 1)}");
+
+        // on reconstruit strictement à partir de la phase courante
+        RebuildFromRuntime();
+    }
+
+    void ApplyMissionUpdateFromNode(int idNum, int? active, int? phase)
+    {
+        string id = "m" + idNum.ToString("00");
+        if (!_rt.TryGetValue(id, out var r)) return;
+
+        // si visible à l'écran → on ignore les modifs (verrou UX)
+        int visIndex = _active.IndexOf(id);
+        bool isVisible = visIndex >= 0 && visIndex < visibleActiveSlots;
+        if (isVisible)
+        {
+            if (logMessages) Debug.Log($"[IA] update ignoré pour {id} (visible).");
+            return;
+        }
+
+        if (active.HasValue) r.active = (active.Value == 1);
+        if (phase.HasValue) r.phase = Mathf.Clamp(phase.Value, 0, 1);
+
+        // mise à jour stricte de la queue + refill
+        PurgeQueueForCurrentPhase();
+
+        // si éligible à la phase courante et pas déjà planifiée → ajouter
+        if (IsEligibleNow(id) && !_queue.Contains(id) && !_active.Contains(id))
+        {
+            if (_active.Count < visibleActiveSlots) { _active.Add(id); r.run = RunState.Running; }
+            else { _queue.Enqueue(id); r.run = RunState.Running; }
+        }
+        else if (!IsEligibleNow(id))
+        {
+            r.run = (r.run == RunState.Done) ? RunState.Done : RunState.Idle;
+        }
+
+        RefillActiveFromQueue();
+        UpdateUI();
+    }
+
     bool TryResolveMissionId(string token, out string id)
     {
         id = null;
         if (string.IsNullOrWhiteSpace(token)) return false;
-
         var t = token.Trim();
-        var byId = missions.FirstOrDefault(m => string.Equals(m.id, t, StringComparison.OrdinalIgnoreCase));
-        if (byId != null) { id = byId.id; return true; }
 
+        var mId = Regex.Match(t, @"^m(\d{1,2})$", RegexOptions.IgnoreCase);
+        if (mId.Success && int.TryParse(mId.Groups[1].Value, out var n1))
+        { if (n1 >= 1 && n1 <= missions.Length) { id = "m" + n1.ToString("00"); return true; } }
+
+        if (Regex.IsMatch(t, @"^\d{1,2}$") && int.TryParse(t, out var n2))
+        { if (n2 >= 1 && n2 <= missions.Length) { id = "m" + n2.ToString("00"); return true; } }
+
+        string s = Slug(t);
         foreach (var m in missions)
-            if (Slug(m.title) == Slug(t) || Slug(m.startAlias) == Slug(t)) { id = m.id; return true; }
+            if (Slug(m.title) == s || Slug(m.startAlias) == s) { id = m.id; return true; }
 
         return false;
     }
@@ -417,14 +611,63 @@ public class WSMissionsBoard : MonoBehaviour
     {
         foreach (var id in now)
             if (!prev.Contains(id))
-                await SendTextAsync(OutMessageFor(id));   // ok si doublon, demandé
+                await SendTextAsync(OutMessageFor(id));
     }
 
     string OutMessageFor(string id)
     {
         var m = missions.FirstOrDefault(x => x.id == id);
+        var r = (m != null && _rt.TryGetValue(id, out var rr)) ? rr : null;
         if (m == null) return "Mission ?";
-        return string.IsNullOrWhiteSpace(m.outMessage) ? $"Mission {m.number}" : m.outMessage;
+        string padded = (r != null ? r.number : m.number).ToString("D6");
+        return string.IsNullOrWhiteSpace(m.outMessage) ? $"Mission {padded}" : m.outMessage;
+    }
+
+    void StartMission(string id)
+    {
+        if (_active.Contains(id) || _queue.Contains(id)) return;
+        var r = _rt[id];
+        if (r.run == RunState.Done) return;
+
+        var prevVisible = VisibleActiveSnapshot();
+
+        if (IsEligibleNow(id))
+        {
+            if (_active.Count < visibleActiveSlots) { _active.Add(id); r.run = RunState.Running; }
+            else { _queue.Enqueue(id); r.run = RunState.Running; }
+        }
+
+        var nowVisible = VisibleActiveSnapshot();
+        _ = Task.Run(() => NotifyNewlyVisible(prevVisible, nowVisible));
+
+        UpdateUI();
+    }
+
+    void CompleteMission(string id)
+    {
+        var r = _rt[id];
+        var prevVisible = VisibleActiveSnapshot();
+
+        int i = _active.IndexOf(id);
+        if (i >= 0) _active.RemoveAt(i);
+        else
+        {
+            var q = _queue.ToArray().ToList();
+            if (q.Remove(id)) { _queue.Clear(); foreach (var k in q) _queue.Enqueue(k); }
+        }
+
+        r.run = RunState.Done;
+        if (_done.Contains(id)) _done.Remove(id);
+        _done.AddFirst(id);
+        while (_done.Count > MaxDone) _done.RemoveLast();
+
+        // refill strict phase courante
+        RefillActiveFromQueue();
+
+        var nowVisible = VisibleActiveSnapshot();
+        _ = Task.Run(() => NotifyNewlyVisible(prevVisible, nowVisible));
+
+        UpdateUI();
     }
 
     void ChangeVisibleSlots(int newCount)
@@ -435,11 +678,8 @@ public class WSMissionsBoard : MonoBehaviour
         var prevVisible = VisibleActiveSnapshot();
         visibleActiveSlots = newCount;
 
-        // si on augmente la capacité, remplir depuis la queue
-        while (_active.Count < visibleActiveSlots && _queue.Count > 0)
-            _active.Add(_queue.Dequeue());
+        RefillActiveFromQueue();
 
-        // ON/OFF des racines au-dessus/la-dessous du cap
         for (int i = 0; i < (ongoingSlots?.Length ?? 0); i++)
         {
             var root = SlotRoot(ongoingSlots[i]);
@@ -455,57 +695,15 @@ public class WSMissionsBoard : MonoBehaviour
         if (logMessages) Debug.Log($"[IA] visibleActiveSlots = {visibleActiveSlots}");
     }
 
-    void StartMission(string id)
-    {
-        if (_active.Contains(id) || _queue.Contains(id)) return;
-
-        var prevVisible = VisibleActiveSnapshot();
-
-        if (_active.Count < visibleActiveSlots) _active.Add(id);
-        else _queue.Enqueue(id);
-
-        var nowVisible = VisibleActiveSnapshot();
-        _ = Task.Run(() => NotifyNewlyVisible(prevVisible, nowVisible));
-
-        UpdateUI();
-    }
-
-    void CompleteMission(string id)
-    {
-        var prevVisible = VisibleActiveSnapshot();
-
-        int i = _active.IndexOf(id);
-        if (i >= 0)
-        {
-            _active.RemoveAt(i);
-            if (_queue.Count > 0 && _active.Count < visibleActiveSlots)
-                _active.Add(_queue.Dequeue());
-        }
-        else
-        {
-            var q = _queue.ToArray().ToList();
-            if (q.Remove(id)) { _queue.Clear(); foreach (var k in q) _queue.Enqueue(k); }
-        }
-
-        if (_done.Contains(id)) _done.Remove(id);
-        _done.AddFirst(id);
-        while (_done.Count > MaxDone) _done.RemoveLast();
-
-        var nowVisible = VisibleActiveSnapshot();
-        _ = Task.Run(() => NotifyNewlyVisible(prevVisible, nowVisible));
-
-        UpdateUI();
-    }
-
     // ---------- Data ----------
     [Serializable]
     public class MissionDef
     {
-        public string id;           // m01...
-        public string title;        // libellé
-        public string startAlias;   // slug d’écoute (ex: hippo_glouton)
-        public int number = 0;      // X pour "Mission X"
-        public string outMessage;   // si vide => "Mission X"
+        public string id;
+        public string title;
+        public string startAlias;
+        public int number = 0;
+        public string outMessage;
     }
 
     public static MissionDef[] DefaultMissions()
@@ -528,7 +726,7 @@ public class WSMissionsBoard : MonoBehaviour
                 title = title,
                 startAlias = Slug(title),
                 number = num,
-                outMessage = $"Mission {num}"
+                outMessage = $"Mission {num.ToString("D6")}"
             });
         }
         return list.ToArray();
