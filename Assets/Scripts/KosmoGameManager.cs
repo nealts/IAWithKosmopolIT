@@ -430,8 +430,8 @@ public class KosmoGameManager : MonoBehaviour
             case 0: return Color.white; // white
             case 1: return new Color(0.98f, 0.85f, 0.15f, 1f); // Jaune
             case 2: return new Color(0.15f, 0.80f, 0.25f, 1f); // vert
-            case 3: return new Color(0.90f, 0.10f, 0.10f, 1f); // Rouge
-            case 4: return new Color(0.10f, 0.45f, 0.95f, 1f); // Bleu
+            case 3: return new Color(0.10f, 0.45f, 0.95f, 1f); // Bleu
+            case 4: return new Color(0.90f, 0.10f, 0.10f, 1f); // Rouge
             default: return Color.black; // Noir
         }
     }
