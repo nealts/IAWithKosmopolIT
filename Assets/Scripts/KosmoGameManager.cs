@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
+using System;
 
 [System.Serializable]
 public class FlagSeries
@@ -45,10 +46,12 @@ public class KosmoGameManager : MonoBehaviour
     public List<FlagSeries> series = new List<FlagSeries>();
 
     // --- état
+    public static event Action GameCompleted;
     int _currentSeriesIndex = -1;
     bool _busy = false;
     bool _readyForQueuedSwitch = false;
     int? _queuedNextSeriesOneBased = null;
+    bool _completionNotified = false;
 
     // overlays
     GameObject _bigCrossGO;
@@ -65,11 +68,16 @@ public class KosmoGameManager : MonoBehaviour
     Coroutine _hideProgressCoroutine;
     float _smoothFill = 0f;
 
+    // Props anims
+    public GameObject dna2D;
+    public GameObject fakeDNA;
+    public GameObject ProgressRoot;
     // =================== LIFECYCLE ===================
+
     void Awake()
     {
         EnsureSeries();
-
+        if (dna2D) dna2D.SetActive(false);
         // branchement des boutons
         for (int i = 0; i < buttons.Length; i++)
         {
@@ -138,6 +146,11 @@ public class KosmoGameManager : MonoBehaviour
         s.solved = true;
         _progressWins = Mathf.Min(progressMaxWins, _progressWins + 1);
         ApplyProgressUI(true);
+        if (!_completionNotified && _progressWins >= progressMaxWins)
+        {
+            _completionNotified = true;
+            GameCompleted?.Invoke();
+        }
         PlaceBigGreenCheck();
 
         SetButtonsInteractable(false);
@@ -167,6 +180,11 @@ public class KosmoGameManager : MonoBehaviour
             s.solved = true;
             _progressWins = Mathf.Min(progressMaxWins, _progressWins + 1);
             ApplyProgressUI(true);
+            if (!_completionNotified && _progressWins >= progressMaxWins)
+            {
+                _completionNotified = true;
+                GameCompleted?.Invoke();
+            }
             PlaceBigGreenCheck();
         }
         else
@@ -331,7 +349,7 @@ public class KosmoGameManager : MonoBehaviour
             {
                 var outerGo = new GameObject($"Outer{i + 1}", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
                 var img = outerGo.GetComponent<Image>();
-                img.color = (i == 5) ? Color.white : GetButtonColor(i); // dernier = blanc
+                img.color = (i == 5) ? Color.black : GetButtonColor(i); // dernier = blanc
                 img.raycastTarget = false;
                 outerGo.transform.SetParent(parent, false);
                 _outer[i] = img;
@@ -375,7 +393,6 @@ public class KosmoGameManager : MonoBehaviour
             ort.anchoredPosition = srt.anchoredPosition;
             ort.sizeDelta = srt.sizeDelta;
             ort.localScale = new Vector3(outerScale.x, outerScale.y, 1f);
-            _outer[i].color = (i == 5) ? Color.white : GetButtonColor(i);
 
             var irt = _inner[i].rectTransform;
             irt.anchorMin = srt.anchorMin;
@@ -384,7 +401,18 @@ public class KosmoGameManager : MonoBehaviour
             irt.anchoredPosition = srt.anchoredPosition;
             irt.sizeDelta = srt.sizeDelta;
             irt.localScale = new Vector3(innerScale.x, innerScale.y, 1f);
-            _inner[i].color = Color.black;
+
+            // <<< COULEURS >>>
+            if (i == 5)       // 6e drapeau : inverse
+            {
+                _outer[i].color = Color.black;
+                _inner[i].color = Color.white;
+            }
+            else              // les 5 premiers comme avant
+            {
+                _outer[i].color = GetButtonColor(i);
+                _inner[i].color = Color.black;
+            }
 
             int flagSibling = slots[i].transform.GetSiblingIndex();
             _outer[i].transform.SetSiblingIndex(Mathf.Max(0, flagSibling - 2));
@@ -395,14 +423,16 @@ public class KosmoGameManager : MonoBehaviour
     Color GetButtonColor(int index)
     {
         // Rouge, Bleu, Vert, Jaune, Blanc, Noir
+        //Blanc Color.white, Jaune, Vert, Rouge, Bleu, Noir Color.black
         switch (index)
         {
-            case 0: return new Color(0.90f, 0.10f, 0.10f, 1f); // rouge
-            case 1: return new Color(0.10f, 0.45f, 0.95f, 1f); // bleu
+
+            case 0: return Color.white; // white
+            case 1: return new Color(0.98f, 0.85f, 0.15f, 1f); // Jaune
             case 2: return new Color(0.15f, 0.80f, 0.25f, 1f); // vert
-            case 3: return new Color(0.98f, 0.85f, 0.15f, 1f); // jaune
-            case 4: return Color.white;
-            default: return Color.black;
+            case 3: return new Color(0.90f, 0.10f, 0.10f, 1f); // Rouge
+            case 4: return new Color(0.10f, 0.45f, 0.95f, 1f); // Bleu
+            default: return Color.black; // Noir
         }
     }
 
@@ -423,6 +453,7 @@ public class KosmoGameManager : MonoBehaviour
                 slots[i].color = Color.white;
                 var x = slots[i].transform.Find("X");
                 if (x) Destroy(x.gameObject);
+
             }
         }
         if (!v) DestroyBigOverlays();
@@ -488,6 +519,12 @@ public class KosmoGameManager : MonoBehaviour
             if (_hideProgressCoroutine != null) StopCoroutine(_hideProgressCoroutine);
             _hideProgressCoroutine = StartCoroutine(HideProgressAfterDelay(progressAutoHideSeconds));
         }
+        if (_progressWins >= progressMaxWins && dna2D)
+        {
+            dna2D.SetActive(true);
+            fakeDNA.SetActive(false);
+            ProgressRoot.SetActive(false);
+        }
     }
 
     IEnumerator AnimateProgressTo(float target)
@@ -529,7 +566,43 @@ public class KosmoGameManager : MonoBehaviour
         GlitchGroupManager.Instance?.ApplyProgress01(_smoothFill);
     }
 
+    public void ForceWin()
+    {
+        // On force le compteur à la valeur max
+        _progressWins = progressMaxWins;
+        ApplyProgressUI(true);
 
+        // Si tu utilises déjà le système de "4/4 atteint" (GameCompleted),
+        // on le déclenche ici aussi pour avoir exactement le même comportement.
+#if UNITY_EDITOR || true
+        try
+        {
+            // Si tu as ajouté dans un précédent message :
+            // public static event Action GameCompleted;
+            // bool _completionNotified;
+            var field = typeof(KosmoGameManager).GetField("_completionNotified",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var ev = typeof(KosmoGameManager).GetField("GameCompleted",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+
+            if (field != null && ev != null)
+            {
+                bool already = (bool)field.GetValue(this);
+                if (!already)
+                {
+                    field.SetValue(this, true);
+                    var del = (System.Delegate)ev.GetValue(null);
+                    del?.DynamicInvoke();
+                }
+            }
+        }
+        catch
+        {
+            // Si tu n'as pas encore mis en place GameCompleted/_completionNotified,
+            // ça ne casse rien, on ignore.
+        }
+#endif
+    }
     IEnumerator HideProgressAfterDelay(float delay)
     {
         yield return new WaitForSeconds(delay);

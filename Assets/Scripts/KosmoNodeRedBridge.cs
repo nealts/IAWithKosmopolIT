@@ -106,6 +106,12 @@ public class KosmoNodeRedBridge : MonoBehaviour
             var j = JsonUtility.FromJson<JsonWrap>(EnsureJson(msg));
             if (j != null)
             {
+                if (j.forceWin)
+                {
+                    _main.Enqueue(() => gameManager?.ForceWin());
+                    Debug.Log("[Bridge] -> ForceWin()");
+                    return;
+                }
                 if (j.fail)
                 {
                     _main.Enqueue(() => gameManager?.OnOutcome(false, null));
@@ -131,6 +137,13 @@ public class KosmoNodeRedBridge : MonoBehaviour
 
         // --- Texte brut ---
         var lower = msg.ToLower();
+
+        if (lower.StartsWith("forcewin"))
+        {
+            _main.Enqueue(() => gameManager?.ForceWin());
+            Debug.Log("[Bridge] -> ForceWin() (text)");
+            return;
+        }
 
         if (lower.StartsWith("success"))
         {
@@ -179,7 +192,7 @@ public class KosmoNodeRedBridge : MonoBehaviour
         return 0;
     }
 
-    [Serializable] class JsonWrap { public bool fail; public int success; public int son; }
+    [Serializable] class JsonWrap { public bool fail; public int success; public int son; public bool forceWin; }
 
     string EnsureJson(string s)
     {
@@ -188,6 +201,7 @@ public class KosmoNodeRedBridge : MonoBehaviour
         if (s.ToLower().StartsWith("success")) { var n = ExtractInt(s.ToLower()); return "{\"success\":" + n + "}"; }
         if (s.ToLower().StartsWith("fail")) { return "{\"fail\":true}"; }
         if (s.ToLower().StartsWith("son")) { var n = ExtractInt(s.ToLower()); return "{\"son\":" + n + "}"; }
+        if (s.ToLower().StartsWith("forcewin")) { return "{\"forceWin\":true}"; }
         return "{}";
     }
 

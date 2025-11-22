@@ -2,6 +2,7 @@
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
+using System.Collections;
 
 [DisallowMultipleComponent]
 public class MatrixRainController : MonoBehaviour
@@ -44,6 +45,11 @@ public class MatrixRainController : MonoBehaviour
     [TextArea(1, 3)]
     public string charset = "0123456789 ";
 
+    [Header("Fade out")]
+    public float fadeOutDuration = 3f;     // durée du Lerp jusqu'à disparition
+    private bool _isFading = false;
+    private CanvasGroup _canvasGroup;
+
     // --- internes ---
     private RectTransform rt;
     private readonly List<MatrixColumn> pool = new();
@@ -58,8 +64,13 @@ public class MatrixRainController : MonoBehaviour
             if (!cv) cv = gameObject.AddComponent<Canvas>();
             cv.overrideSorting = true;
             cv.sortingOrder = sortingOrder;   // lower = behind
-            // keep the same render mode as parent (Unity auto-inherits from root)
         }
+
+        // <<< nouveau : CanvasGroup pour gérer l'alpha global
+        _canvasGroup = GetComponent<CanvasGroup>();
+        if (!_canvasGroup) _canvasGroup = gameObject.AddComponent<CanvasGroup>();
+        _canvasGroup.alpha = 1f;
+        // >>>
 
         rt = GetComponent<RectTransform>();
         if (!targetArea) targetArea = rt;
@@ -73,8 +84,17 @@ public class MatrixRainController : MonoBehaviour
         Build();
     }
 
-    void OnEnable() { foreach (var c in pool) if (c) c.enabled = true; }
-    void OnDisable() { foreach (var c in pool) if (c) c.enabled = false; }
+    void OnEnable()
+    {
+        foreach (var c in pool) if (c) c.enabled = true;
+        KosmoGameManager.GameCompleted += HandleGameCompleted;   // écoute l'event
+    }
+
+    void OnDisable()
+    {
+        foreach (var c in pool) if (c) c.enabled = false;
+        KosmoGameManager.GameCompleted -= HandleGameCompleted;   // se désabonne
+    }
 
     void OnDestroy()
     {
@@ -138,6 +158,42 @@ public class MatrixRainController : MonoBehaviour
                   charRefreshInterval, shuffleRatio, headColor, tailColor,
                   pixelPerLine, desync);
         return col;
+    }
+
+    void HandleGameCompleted()
+    {
+        if (!_isFading)
+            StartCoroutine(FadeOutAndDisable());
+    }
+
+    IEnumerator FadeOutAndDisable()
+    {
+        _isFading = true;
+
+        float startAlpha = _canvasGroup ? _canvasGroup.alpha : 1f;
+        float t = 0f;
+
+        while (t < fadeOutDuration)
+        {
+            t += Time.deltaTime;
+            float k = Mathf.Clamp01(t / fadeOutDuration);
+
+            if (_canvasGroup)
+                _canvasGroup.alpha = Mathf.Lerp(startAlpha, 0f, k);
+
+            yield return null;
+        }
+
+        if (_canvasGroup)
+            _canvasGroup.alpha = 0f;
+
+        // désactive tous les MatrixColumn
+        foreach (var c in pool) if (c) c.enabled = false;
+
+        // désactive aussi ce contrôleur
+        this.enabled = false;
+        // Si tu veux le masquer totalement :
+        // gameObject.SetActive(false);
     }
 
     public void ApplyRuntime()
