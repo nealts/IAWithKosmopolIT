@@ -17,11 +17,15 @@ public class WSMissionsBoard : MonoBehaviour
     public bool autoReconnect = true;
     public float reconnectDelaySec = 3f;
 
-    [Header("UI - Réparations en cours (4 max)")]
+    [Header("UI - Réparations en cours (4 slots max dans la scène)")]
     public TextMeshProUGUI[] ongoingSlots = new TextMeshProUGUI[4];
 
     [Header("UI - Missions terminées (6 max)")]
     public TextMeshProUGUI[] doneSlots = new TextMeshProUGUI[6];
+
+    [Header("Affichage")]
+    [Tooltip("Nombre de missions affichées simultanément (2..4)")]
+    [Range(2, 4)] public int visibleActiveSlots = 4;
 
     [Header("Catalogue de missions")]
     public MissionDef[] missions = DefaultMissions();
@@ -29,11 +33,10 @@ public class WSMissionsBoard : MonoBehaviour
     [Header("Debug")]
     public bool logMessages = true;
 
-    // État
-    readonly List<string> _active = new List<string>(4);       // ids visibles en priorité
-    readonly Queue<string> _queue = new Queue<string>();       // ids en attente
-    readonly LinkedList<string> _done = new LinkedList<string>(); // ids terminées (tête = plus récent)
-    const int MaxActive = 4;
+    // Etat
+    readonly List<string> _active = new List<string>(4);          // visibles
+    readonly Queue<string> _queue = new Queue<string>();          // en attente
+    readonly LinkedList<string> _done = new LinkedList<string>(); // terminées (tête = plus récent)
     const int MaxDone = 6;
 
     // WS infra
@@ -43,9 +46,22 @@ public class WSMissionsBoard : MonoBehaviour
     bool _closing;
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
 
+    // ---------- Unity ----------
     void Start()
     {
+        // clamp par sécurité selon les slots réellement assignés
+        int maxSlotsInScene = Mathf.Clamp(ongoingSlots?.Length ?? 0, 2, 4);
+        visibleActiveSlots = Mathf.Clamp(visibleActiveSlots, 2, maxSlotsInScene);
+
         ClearAllUI();
+
+        // force OFF les slots au-delà de la capacité choisie (ex: 2 => cache 3 & 4)
+        for (int i = visibleActiveSlots; i < (ongoingSlots?.Length ?? 0); i++)
+        {
+            var r = SlotRoot(ongoingSlots[i]);
+            if (r) r.SetActive(false);
+        }
+
         Connect();
     }
 
@@ -64,6 +80,62 @@ public class WSMissionsBoard : MonoBehaviour
         _done.Clear();
         UpdateUI();
     }
+
+    // ---------- Helpers UI ----------
+    GameObject SlotRoot(TextMeshProUGUI t)
+    {
+        if (!t) return null;
+        var p = t.transform.parent as RectTransform;
+        return p ? p.gameObject : t.gameObject; // parent (image + deco) si présent, sinon le TMP lui-même
+    }
+
+    void ClearAllUI()
+    {
+        foreach (var t in ongoingSlots)
+        {
+            if (!t) continue;
+            t.text = "";
+            var root = SlotRoot(t);
+            if (root) root.SetActive(false);
+        }
+        foreach (var t in doneSlots)
+        {
+            if (!t) continue;
+            t.text = "";
+            var root = t.transform.parent ? t.transform.parent.gameObject : t.gameObject;
+            if (root) root.SetActive(false);
+        }
+    }
+
+    void UpdateUI()
+    {
+        // En cours — n’affiche que jusqu’à visibleActiveSlots
+        for (int i = 0; i < ongoingSlots.Length; i++)
+        {
+            var t = ongoingSlots[i];
+            if (!t) continue;
+            var root = SlotRoot(t);
+
+            bool show = i < visibleActiveSlots && i < _active.Count;
+            if (root && root.activeSelf != show) root.SetActive(show);
+            t.text = show ? TitleOf(_active[i]) : "";
+        }
+
+        // Terminées (plus récent en haut)
+        var doneArr = _done.ToArray();
+        for (int i = 0; i < doneSlots.Length; i++)
+        {
+            var t = doneSlots[i];
+            if (!t) continue;
+            var root = t.transform.parent ? t.transform.parent.gameObject : t.gameObject;
+
+            bool show = i < doneArr.Length;
+            if (root && root.activeSelf != show) root.SetActive(show);
+            t.text = show ? TitleOf(doneArr[i]) : "";
+        }
+    }
+
+    string TitleOf(string id) => missions.FirstOrDefault(m => m.id == id)?.title ?? id;
 
     // ---------- WebSocket ----------
     async void Connect()
@@ -150,10 +222,7 @@ public class WSMissionsBoard : MonoBehaviour
             }
             else if (logMessages) Debug.LogWarning("[WS] send skipped (not connected): " + text);
         }
-        catch (Exception e)
-        {
-            Debug.LogWarning("[WS] send failed: " + e.Message);
-        }
+        catch (Exception e) { Debug.LogWarning("[WS] send failed: " + e.Message); }
     }
 
     // ---------- Parsing protocole v1 ----------
@@ -166,7 +235,7 @@ public class WSMissionsBoard : MonoBehaviour
         string intent = null; // "start" | "done" | "reset"
         string token = null; // slug ou id
 
-        // JSON strict {cmd,start|done|reset; mission:token} ou {cmd:start|done; id:m01}
+        // JSON strict
         try
         {
             var j = JsonUtility.FromJson<Cmd>(raw);
@@ -174,11 +243,7 @@ public class WSMissionsBoard : MonoBehaviour
             {
                 var c = j.cmd.Trim().ToLowerInvariant();
                 if (c == "reset") intent = "reset";
-                else if (c == "start" || c == "done")
-                {
-                    intent = c;
-                    token = j.mission ?? j.id;
-                }
+                else if (c == "start" || c == "done") { intent = c; token = j.mission ?? j.id; }
             }
         }
         catch { }
@@ -189,25 +254,15 @@ public class WSMissionsBoard : MonoBehaviour
             var s = raw.Trim();
             var lower = s.ToLowerInvariant();
             if (lower == "reset") intent = "reset";
-            else if (lower.StartsWith("start "))
-            {
-                intent = "start";
-                token = s.Substring(6).Trim();
-            }
-            else if (lower.StartsWith("done "))
-            {
-                intent = "done";
-                token = s.Substring(5).Trim();
-            }
+            else if (lower.StartsWith("start ")) { intent = "start"; token = s.Substring(6).Trim(); }
+            else if (lower.StartsWith("done ")) { intent = "done"; token = s.Substring(5).Trim(); }
         }
 
         _main.Enqueue(() =>
         {
             switch (intent)
             {
-                case "reset":
-                    ResetBoard();
-                    break;
+                case "reset": ResetBoard(); break;
                 case "start":
                     if (TryResolveMissionId(token, out var idStart)) StartMission(idStart);
                     else Debug.LogWarning("[WS] start: mission introuvable pour token='" + token + "'");
@@ -217,8 +272,7 @@ public class WSMissionsBoard : MonoBehaviour
                     else Debug.LogWarning("[WS] done: mission introuvable pour token='" + token + "'");
                     break;
                 default:
-                    Debug.Log("[WS] Message ignoré (format invalide).");
-                    break;
+                    Debug.Log("[WS] Message ignoré (format invalide)."); break;
             }
         });
     }
@@ -235,33 +289,26 @@ public class WSMissionsBoard : MonoBehaviour
 
         // match slug / titre
         foreach (var m in missions)
-        {
-            if (Slug(m.title) == Slug(t) || Slug(m.startAlias) == Slug(t))
-            { id = m.id; return true; }
-        }
+            if (Slug(m.title) == Slug(t) || Slug(m.startAlias) == Slug(t)) { id = m.id; return true; }
+
         return false;
     }
 
     // ---------- Moteur ----------
-    List<string> VisibleActiveSnapshot()
-        => _active.Take(MaxActive).ToList();
+    List<string> VisibleActiveSnapshot() => _active.Take(visibleActiveSlots).ToList();
 
     async void NotifyNewlyVisible(List<string> prev, List<string> now)
     {
-        // envoie pour chaque id présent dans now mais pas dans prev
         foreach (var id in now)
             if (!prev.Contains(id))
-                await SendTextAsync(OutMessageFor(id));
+                await SendTextAsync(OutMessageFor(id));   // seulement quand ça devient visible
     }
 
     string OutMessageFor(string id)
     {
         var m = missions.FirstOrDefault(x => x.id == id);
         if (m == null) return "Mission ?";
-        var msg = string.IsNullOrWhiteSpace(m.outMessage)
-            ? $"Mission {m.number}"
-            : m.outMessage;
-        return msg;
+        return string.IsNullOrWhiteSpace(m.outMessage) ? $"Mission {m.number}" : m.outMessage;
     }
 
     void StartMission(string id)
@@ -270,7 +317,7 @@ public class WSMissionsBoard : MonoBehaviour
 
         var prevVisible = VisibleActiveSnapshot();
 
-        if (_active.Count < MaxActive) _active.Add(id);
+        if (_active.Count < visibleActiveSlots) _active.Add(id);
         else _queue.Enqueue(id);
 
         var nowVisible = VisibleActiveSnapshot();
@@ -287,7 +334,8 @@ public class WSMissionsBoard : MonoBehaviour
         if (i >= 0)
         {
             _active.RemoveAt(i);
-            if (_queue.Count > 0) _active.Add(_queue.Dequeue());
+            if (_queue.Count > 0 && _active.Count < visibleActiveSlots)
+                _active.Add(_queue.Dequeue());
         }
         else
         {
@@ -305,56 +353,13 @@ public class WSMissionsBoard : MonoBehaviour
         UpdateUI();
     }
 
-    void UpdateUI()
-    {
-        // En cours (affiche les visibles uniquement)
-        for (int i = 0; i < ongoingSlots.Length; i++)
-        {
-            if (!ongoingSlots[i]) continue;
-            if (i < _active.Count)
-            {
-                ongoingSlots[i].text = TitleOf(_active[i]);
-                ongoingSlots[i].transform.parent.gameObject.SetActive(true);
-            }
-            else
-            {
-                ongoingSlots[i].text = "";
-                ongoingSlots[i].transform.parent.gameObject.SetActive(false);
-            }
-        }
-
-        // Terminées (plus récent en haut)
-        var doneArr = _done.ToArray();
-        for (int i = 0; i < doneSlots.Length; i++)
-        {
-            if (!doneSlots[i]) continue;
-            if (i < doneArr.Length)
-            {
-                doneSlots[i].text = TitleOf(doneArr[i]);
-                doneSlots[i].transform.parent.gameObject.SetActive(true);
-            }
-            else
-            {
-                doneSlots[i].text = "";
-                doneSlots[i].transform.parent.gameObject.SetActive(false);
-            }
-        }
-    }
-
-    void ClearAllUI()
-    {
-        foreach (var t in ongoingSlots) if (t) { t.text = ""; t.transform.parent.gameObject.SetActive(false); }
-        foreach (var t in doneSlots) if (t) { t.text = ""; t.transform.parent.gameObject.SetActive(false); }
-    }
-
-    string TitleOf(string id) => missions.FirstOrDefault(m => m.id == id)?.title ?? id;
-
+    // ---------- Data ----------
     [Serializable]
     public class MissionDef
     {
         public string id;           // m01...
         public string title;        // libellé
-        public string startAlias;   // slug d'écoute (ex: hippo_glouton)
+        public string startAlias;   // slug d’écoute (ex: hippo_glouton)
         public int number = 0;      // X pour "Mission X"
         public string outMessage;   // si vide => "Mission X"
     }
@@ -379,7 +384,7 @@ public class WSMissionsBoard : MonoBehaviour
                 title = title,
                 startAlias = Slug(title),
                 number = num,
-                outMessage = $"Mission {num}" // modifiable dans l'inspector
+                outMessage = $"Mission {num}"
             });
         }
         return list.ToArray();
@@ -390,7 +395,8 @@ public class WSMissionsBoard : MonoBehaviour
         if (string.IsNullOrEmpty(s)) return "";
         s = s.ToLowerInvariant()
              .Replace("?", "").Replace("'", "").Replace(":", "")
-             .Replace("é", "e").Replace("è", "e").Replace("ê", "e").Replace("à", "a").Replace("ù", "u").Replace("ï", "i").Replace("î", "i").Replace("ô", "o").Replace("ö", "o").Replace("ç", "c");
+             .Replace("é", "e").Replace("è", "e").Replace("ê", "e").Replace("à", "a").Replace("ù", "u")
+             .Replace("ï", "i").Replace("î", "i").Replace("ô", "o").Replace("ö", "o").Replace("ç", "c");
         var sb = new StringBuilder(s.Length);
         foreach (var ch in s)
             if (char.IsLetterOrDigit(ch)) sb.Append(ch);
