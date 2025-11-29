@@ -15,6 +15,14 @@ public class FlagSeries
 
 public class KosmoGameManager : MonoBehaviour
 {
+    [Header("Win feedback settings")]
+    public int winBlinkCount = 3;
+    public float winBlinkInterval = 0.15f;
+
+    [Header("Progress 100% fade-out")]
+    public float progressFadeOutDelay = 0.4f;     // temps d’attente après le remplissage
+    public float progressFadeOutDuration = 0.6f;  // durée du lerp de disparition
+
     public static event Action<int, int> OnKosmoProgress;
     [Header("UI refs (6 chacun)")]
     public RawImage[] slots = new RawImage[6];
@@ -145,18 +153,15 @@ public class KosmoGameManager : MonoBehaviour
 
         if (IsSlotValid(idx) && slots[idx]) slots[idx].color = correctTint;
         s.solved = true;
+
         _progressWins = Mathf.Min(progressMaxWins, _progressWins + 1);
-        ApplyProgressUI(true);
-        OnKosmoProgress?.Invoke(_progressWins, progressMaxWins);
         if (!_completionNotified && _progressWins >= progressMaxWins)
         {
             _completionNotified = true;
             GameCompleted?.Invoke();
         }
-        PlaceBigGreenCheck();
 
-        SetButtonsInteractable(false);
-        StartCoroutine(FeedbackThenWait(feedbackDelay));
+        StartCoroutine(WinFeedbackSequence());
     }
 
     public void OnExternalFail()
@@ -180,24 +185,24 @@ public class KosmoGameManager : MonoBehaviour
         {
             if (IsSlotValid(optionIndex) && slots[optionIndex]) slots[optionIndex].color = correctTint;
             s.solved = true;
+
             _progressWins = Mathf.Min(progressMaxWins, _progressWins + 1);
-            ApplyProgressUI(true);
-            OnKosmoProgress?.Invoke(_progressWins, progressMaxWins);
             if (!_completionNotified && _progressWins >= progressMaxWins)
             {
                 _completionNotified = true;
                 GameCompleted?.Invoke();
             }
-            PlaceBigGreenCheck();
+
+            StartCoroutine(WinFeedbackSequence());
         }
         else
         {
             if (IsSlotValid(optionIndex)) PlaceRedCross(slots[optionIndex]);
             PlaceBigRedCross();
-        }
 
-        SetButtonsInteractable(false);
-        StartCoroutine(FeedbackThenWait(feedbackDelay));
+            SetButtonsInteractable(false);
+            StartCoroutine(FeedbackThenWait(feedbackDelay));
+        }
     }
 
     // =================== Séries ===================
@@ -281,6 +286,62 @@ public class KosmoGameManager : MonoBehaviour
     {
         DestroyBigOverlays();
         _bigCheckGO = CreateCenteredOverlay(winSprite, Color.white);
+    }
+
+    IEnumerator WinFeedbackSequence()
+    {
+        // On bloque les clics pendant tout le feedback
+        SetButtonsInteractable(false);
+
+        // 1) Gros check vert
+        DestroyBigOverlays();
+        PlaceBigGreenCheck();
+
+        if (_bigCheckGO == null)
+        {
+            // sécurité
+            yield return StartCoroutine(FeedbackThenWait(feedbackDelay));
+            yield break;
+        }
+
+        // 2) Blink 3x
+        var cg = _bigCheckGO.GetComponent<CanvasGroup>();
+        if (!cg) cg = _bigCheckGO.AddComponent<CanvasGroup>();
+        cg.alpha = 1f;
+
+        int blinks = Mathf.Max(1, winBlinkCount);
+        float interval = Mathf.Max(0.01f, winBlinkInterval);
+
+        for (int i = 0; i < blinks * 2; i++)
+        {
+            cg.alpha = (i % 2 == 0) ? 1f : 0f;
+            yield return new WaitForSeconds(interval);
+        }
+
+        // on le remet une dernière fois bien visible (optionnel)
+        cg.alpha = 1f;
+
+        // 🔥 3) À ce moment-là, on FAIT DISPARAÎTRE le win sprite
+        DestroyBigOverlays();
+        _bigCheckGO = null;
+
+        // 4) Puis seulement maintenant, on affiche + anime la progress bar
+        if (ProgressRoot) ProgressRoot.SetActive(true);
+        ApplyProgressUI(true);
+
+        // on laisse l'anim se jouer
+        if (progressAnimTime > 0f)
+            yield return new WaitForSeconds(progressAnimTime);
+
+        // 4bis) Si on vient d'atteindre 100% (4/4), on déclenche un fade-out
+        if (_progressWins >= progressMaxWins)
+        {
+            // on ne bloque pas la suite sur le fade : on le lance en parallèle
+            StartCoroutine(FadeOutProgressBar());
+        }
+
+        // 5) On enchaîne sur la logique existante (série suivante, etc.)
+        yield return StartCoroutine(FeedbackThenWait(feedbackDelay));
     }
 
     GameObject CreateCenteredOverlay(Sprite sprite, Color color)
@@ -514,10 +575,34 @@ public class KosmoGameManager : MonoBehaviour
 
     void ApplyProgressUI(bool animate)
     {
-        float target = (progressMaxWins > 0) ? Mathf.Clamp01((float)_progressWins / progressMaxWins) : 0f;
+        float target = (progressMaxWins > 0)
+            ? Mathf.Clamp01((float)_progressWins / progressMaxWins)
+            : 0f;
 
-        if (_progressAnimCo != null) StopCoroutine(_progressAnimCo);
-        _progressAnimCo = StartCoroutine(AnimateProgressTo(target));
+        // On coupe toute anim précédente
+        if (_progressAnimCo != null)
+        {
+            StopCoroutine(_progressAnimCo);
+            _progressAnimCo = null;
+        }
+
+        if (animate && progressAnimTime > 0f)
+        {
+            _progressAnimCo = StartCoroutine(AnimateProgressTo(target));
+        }
+        else
+        {
+            _smoothFill = target;
+            if (progressFill) progressFill.fillAmount = _smoothFill;
+            if (progressSlider) progressSlider.value = _smoothFill;
+            if (progressPercentTMP)
+            {
+                progressPercentTMP.enabled = (_progressWins > 0);
+                progressPercentTMP.text = Mathf.RoundToInt(_smoothFill * 100f) + "%";
+            }
+
+            GlitchGroupManager.Instance?.ApplyProgress01(_smoothFill);
+        }
 
         // cache auto après 100%
         if (Mathf.Approximately(target, 1f) && progressAutoHideSeconds > 0f)
@@ -525,11 +610,17 @@ public class KosmoGameManager : MonoBehaviour
             if (_hideProgressCoroutine != null) StopCoroutine(_hideProgressCoroutine);
             _hideProgressCoroutine = StartCoroutine(HideProgressAfterDelay(progressAutoHideSeconds));
         }
+
+        // passage ADN / fausse ADN quand 4/4
         if (_progressWins >= progressMaxWins && dna2D)
         {
             dna2D.SetActive(true);
-            fakeDNA.SetActive(false);
-            ProgressRoot.SetActive(false);
+            if (fakeDNA) fakeDNA.SetActive(false);
+
+            // ❌ NE PAS désactiver ProgressRoot ici,
+            // on veut laisser la barre visible pour qu'elle puisse animer jusqu'à 100%,
+            // puis la faire disparaître proprement via un fade.
+            // if (ProgressRoot) ProgressRoot.SetActive(false);
         }
     }
 
@@ -570,6 +661,7 @@ public class KosmoGameManager : MonoBehaviour
 
         // un dernier push pour la valeur finale (utile pour 100%)
         GlitchGroupManager.Instance?.ApplyProgress01(_smoothFill);
+        _progressAnimCo = null;
     }
 
     public void ForceWin()
@@ -621,4 +713,33 @@ public class KosmoGameManager : MonoBehaviour
         // if (progressFill) progressFill.enabled = false;
         // if (progressSlider) progressSlider.gameObject.SetActive(false);
     }
+
+    IEnumerator FadeOutProgressBar()
+    {
+        if (!ProgressRoot) yield break;
+
+        // On s'assure qu'elle est visible au début
+        ProgressRoot.SetActive(true);
+        var cg = ProgressRoot.GetComponent<CanvasGroup>();
+        if (!cg) cg = ProgressRoot.AddComponent<CanvasGroup>();
+        cg.alpha = 1f;
+
+        // petit délai avant le fade (on laisse le joueur voir le 100%)
+        if (progressFadeOutDelay > 0f)
+            yield return new WaitForSeconds(progressFadeOutDelay);
+
+        float t = 0f;
+        float startA = cg.alpha;
+        while (t < progressFadeOutDuration)
+        {
+            t += Time.deltaTime;
+            float k = Mathf.Clamp01(t / progressFadeOutDuration);
+            cg.alpha = Mathf.Lerp(startA, 0f, k);
+            yield return null;
+        }
+
+        cg.alpha = 0f;
+        ProgressRoot.SetActive(false);
+    }
+
 }
