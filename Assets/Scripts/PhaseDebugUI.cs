@@ -71,7 +71,6 @@ public class PhaseDebugUI : MonoBehaviour
 
     void OnJumanji1Triggered()
     {
-        // Alerte Jumanji #1 démarrée
         _jumanjiRunning = true;
         SetText("Alerte Jumanji #1");
         StopPhaseRoutine();

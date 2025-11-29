@@ -157,7 +157,7 @@ public class WSAlerts : MonoBehaviour
     }
 
     // ------------- Messages -------------
-    void HandleMessage(string raw)
+    public void HandleMessage(string raw)
     {
         string token = raw.Trim().ToLowerInvariant();
 
