@@ -12,6 +12,13 @@ using UnityEngine;
 
 public class WSMissionsBoard : MonoBehaviour
 {
+
+    [Header("Alertes")]
+    public WSAlerts wsAlerts;   // à lier dans l’inspector
+
+    bool _hippoTriggeredOnce = false;
+    bool _jumanjiTriggered = false;
+
     [Header("WebSocket – Commands (start/done/reset) + outbound")]
     public string wsUrl = "ws://127.0.0.1:1880/ws/missions";
     public bool autoReconnect = true;
@@ -34,6 +41,10 @@ public class WSMissionsBoard : MonoBehaviour
 
     [Header("Debug")]
     public bool logMessages = true;
+
+    bool _missionsUnlocked = false;
+    public static event System.Action Jumanji1Triggered;
+
 
     enum RunState { Idle, Running, Done }
 
@@ -73,6 +84,11 @@ public class WSMissionsBoard : MonoBehaviour
         visibleActiveSlots = Mathf.Clamp(visibleActiveSlots, 2, maxSlotsInScene);
 
         InitRuntimeDefaults();
+
+        // Au démarrage : AUCUNE mission visible
+        _active.Clear();
+        _queue.Clear();
+        _done.Clear();
         ClearAllUI();
 
         for (int i = visibleActiveSlots; i < (ongoingSlots?.Length ?? 0); i++)
@@ -81,10 +97,18 @@ public class WSMissionsBoard : MonoBehaviour
             if (r) r.SetActive(false);
         }
 
-        RebuildFromRuntime(); // construit _active/_queue pour la phase courante
-
+        // Surtout : on NE fait PAS RebuildFromRuntime ici.
         ConnectCmd();
         ConnectIa();
+    }
+
+    public void UnlockMissions()
+    {
+        if (_missionsUnlocked) return;
+        _missionsUnlocked = true;
+
+        // On reconstruit proprement à partir de l’état runtime
+        RebuildFromRuntime();
     }
 
     // Initialise l'état runtime par défaut : 10 missions en Phase 1, le reste en Phase 2.
@@ -161,6 +185,13 @@ public class WSMissionsBoard : MonoBehaviour
 
     void UpdateUI()
     {
+        // Tant que les missions ne sont pas débloquées : on force tout à vide / caché
+        if (!_missionsUnlocked)
+        {
+            ClearAllUI();
+            return;
+        }
+
         for (int i = 0; i < ongoingSlots.Length; i++)
         {
             var t = ongoingSlots[i];
@@ -183,6 +214,46 @@ public class WSMissionsBoard : MonoBehaviour
             if (root && root.activeSelf != show) root.SetActive(show);
             t.text = show ? TitleOf(doneArr[i]) : "";
         }
+
+        // 🔥 Vérifie si on doit déclencher Jumanji
+        CheckForJumanjiTrigger();
+    }
+
+    void CheckForJumanjiTrigger()
+    {
+        // Déjà déclenchée -> on ne refait rien
+        if (_jumanjiTriggered) return;
+
+        // Missions pas encore débloquées -> on attend
+        if (!_missionsUnlocked) return;
+
+        // On ne veut ça qu'en Phase 1
+        if (_currentPhase != 0) return;
+
+        // On veut que l'alerte Hippo ait été déclenchée au moins une fois
+        if (!_hippoTriggeredOnce) return;
+
+        // "Pool de missions vide" = aucune mission active ni en queue
+        if (_active.Count > 0) return;
+        if (_queue.Count > 0) return;
+
+        if (!wsAlerts)
+        {
+            if (logMessages) Debug.LogWarning("[Missions] Jumanji NON déclenchée: wsAlerts non assigné.");
+            return;
+        }
+
+        _jumanjiTriggered = true;
+
+        // On déclenche bien **jumanji1**
+        wsAlerts.SendManualAlert("jumanji1");
+
+        // On notifie l'extérieur (PhaseDebugUI par ex.)
+        Jumanji1Triggered?.Invoke();
+
+        if (logMessages)
+            Debug.Log("[Missions] Alerte Jumanji1 déclenchée (Phase 1, pool vide, Hippo déjà passée).");
+
     }
 
     string TitleOf(string id) => missions.FirstOrDefault(m => m.id == id)?.title ?? id;
@@ -604,8 +675,56 @@ public class WSMissionsBoard : MonoBehaviour
 
         return false;
     }
+    void OnEnable()
+    {
+        KosmoGameManager.GameCompleted += OnFlagsGameCompleted;
+        EnergyAlertController.HippoAlertTriggered += OnHippoAlertTriggered;
+        WSAlerts.StopCommandReceived += OnStopCommandReceived;   // 👈 nouveau
+    }
 
-    List<string> VisibleActiveSnapshot() => _active.Take(visibleActiveSlots).ToList();
+    void OnDisable()
+    {
+        KosmoGameManager.GameCompleted -= OnFlagsGameCompleted;
+        EnergyAlertController.HippoAlertTriggered -= OnHippoAlertTriggered;
+        WSAlerts.StopCommandReceived -= OnStopCommandReceived;   // 👈 nouveau
+    }
+
+    void OnStopCommandReceived()
+    {
+        // On ne s’intéresse qu’au stop pendant Jumanji1 et tant qu’on est en Phase 1
+        if (_jumanjiTriggered && _currentPhase == 0)
+        {
+            // 👉 Ici on lance la Phase 2 (index 1)
+            BeginPhase(1);
+            Debug.Log("[Missions] stopAlerte pendant Jumanji1 → passage en Phase 2");
+        }
+    }
+    
+
+    void OnHippoAlertTriggered()
+    {
+        _hippoTriggeredOnce = true;
+        CheckForJumanjiTrigger();
+    }
+
+    void OnFlagsGameCompleted()
+    {
+        // Ici, on est sûr : 4/4 atteint, barre à 100% et ProgressRoot désactivé.
+        // On peut éventuellement attendre un chouïa pour laisser les anims finir.
+        StartCoroutine(DelayedUnlockMissions());
+    }
+
+    System.Collections.IEnumerator DelayedUnlockMissions()
+    {
+        // Petit délai soft pour laisser finir les feedbacks visuels
+        yield return new WaitForSeconds(0.5f);
+        UnlockMissions();
+    }
+    List<string> VisibleActiveSnapshot()
+    {
+        if (!_missionsUnlocked) return new List<string>();
+        return _active.Take(visibleActiveSlots).ToList();
+    }
 
     async void NotifyNewlyVisible(List<string> prev, List<string> now)
     {

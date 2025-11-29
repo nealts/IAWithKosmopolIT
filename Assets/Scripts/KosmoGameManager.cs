@@ -15,6 +15,7 @@ public class FlagSeries
 
 public class KosmoGameManager : MonoBehaviour
 {
+    public static event Action<int, int> OnKosmoProgress;
     [Header("UI refs (6 chacun)")]
     public RawImage[] slots = new RawImage[6];
     public Button[] buttons = new Button[6];
@@ -146,6 +147,7 @@ public class KosmoGameManager : MonoBehaviour
         s.solved = true;
         _progressWins = Mathf.Min(progressMaxWins, _progressWins + 1);
         ApplyProgressUI(true);
+        OnKosmoProgress?.Invoke(_progressWins, progressMaxWins);
         if (!_completionNotified && _progressWins >= progressMaxWins)
         {
             _completionNotified = true;
@@ -180,6 +182,7 @@ public class KosmoGameManager : MonoBehaviour
             s.solved = true;
             _progressWins = Mathf.Min(progressMaxWins, _progressWins + 1);
             ApplyProgressUI(true);
+            OnKosmoProgress?.Invoke(_progressWins, progressMaxWins);
             if (!_completionNotified && _progressWins >= progressMaxWins)
             {
                 _completionNotified = true;
@@ -266,6 +269,8 @@ public class KosmoGameManager : MonoBehaviour
         rt.offsetMin = Vector2.zero; rt.offsetMax = Vector2.zero;
     }
 
+
+
     void PlaceBigRedCross()
     {
         DestroyBigOverlays();
@@ -294,6 +299,7 @@ public class KosmoGameManager : MonoBehaviour
         rt.anchorMax = new Vector2(0.5f, 0.5f);
         rt.sizeDelta = new Vector2(400f, 400f);
         rt.anchoredPosition = Vector2.zero;
+        rt.anchoredPosition = new Vector2(0f, 155f);
         go.transform.SetAsLastSibling();
         return go;
     }

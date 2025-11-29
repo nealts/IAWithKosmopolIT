@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
@@ -8,6 +8,8 @@ using UnityEngine;
 
 public class WSAlerts : MonoBehaviour
 {
+    public static event System.Action HippoAlertStopped;
+    public static event System.Action StopCommandReceived;
     [Header("WebSocket")]
     [Tooltip("Endpoint Node-RED: ws://host:port/ws/ia")]
     public string wsUrl = "ws://127.0.0.1:1880/ws/ia";
@@ -16,13 +18,12 @@ public class WSAlerts : MonoBehaviour
     public bool logMessages = true;
 
     [Header("Alert GameObjects")]
-    public GameObject alertHippo;
-    public GameObject alertJumanji1;
-    public GameObject alertJumanji2;
+    public GameObject alertHippo;    // Alerte-hg
+    public GameObject alertJumanji;  // Alerte-j (utilisée pour jumanji1 + jumanji2)
 
     [Header("Blink settings")]
-    [Range(0.1f, 5f)] public float blinkIntervalSec = 1f;
-    [Range(0f, 1f)] public float dimAlpha = 0.5f;
+    [Range(0.1f, 5f)] public float blinkIntervalSec = 1f;  // 1s entre chaque changement
+    [Range(0f, 1f)] public float dimAlpha = 0.5f;          // 50% d'opacité
 
     // --- runtime ---
     ClientWebSocket _ws;
@@ -30,17 +31,19 @@ public class WSAlerts : MonoBehaviour
     Task _recvTask;
     bool _closing;
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
+
     Coroutine _blinkCo;
     CanvasGroup _currentCg;
 
-    [Serializable] class AlertJson { public string alert; public string cmd; }
+    [Serializable]
+    class AlertJson { public string alert; public string cmd; }
 
     void Start()
     {
-        // d�sactive tous les alerts au lancement
+        // Désactive toutes les alertes au lancement
         SetActive(alertHippo, false);
-        SetActive(alertJumanji1, false);
-        SetActive(alertJumanji2, false);
+        SetActive(alertJumanji, false);
+
         Connect();
     }
 
@@ -51,7 +54,7 @@ public class WSAlerts : MonoBehaviour
 
     void OnApplicationQuit() => _ = CloseWS();
 
-    // ------------- WS infra -------------
+    // ------------- WebSocket infra -------------
     async void Connect()
     {
         await CloseWS();
@@ -71,6 +74,22 @@ public class WSAlerts : MonoBehaviour
             if (autoReconnect) Invoke(nameof(RetryConnect), reconnectDelaySec);
         }
     }
+
+    public void SendManualAlert(string token)
+    {
+        switch (token.ToLowerInvariant())
+        {
+            case "hippo":
+                ShowBlink(alertHippo);
+                break;
+
+            case "jumanji1":
+            case "jumanji2":
+                ShowBlink(alertJumanji);
+                break;
+        }
+    }
+
 
     void RetryConnect()
     {
@@ -128,7 +147,13 @@ public class WSAlerts : MonoBehaviour
             }
         }
         catch { }
-        finally { _ws = null; _cts = null; _recvTask = null; _closing = false; }
+        finally
+        {
+            _ws = null;
+            _cts = null;
+            _recvTask = null;
+            _closing = false;
+        }
     }
 
     // ------------- Messages -------------
@@ -136,7 +161,7 @@ public class WSAlerts : MonoBehaviour
     {
         string token = raw.Trim().ToLowerInvariant();
 
-        // support JSON simple { "alert":"hippo" } / { "cmd":"hippo" }
+        // Support JSON simple { "alert":"hippo" } / { "cmd":"hippo" }
         if (token.StartsWith("{") && token.EndsWith("}"))
         {
             try
@@ -148,7 +173,10 @@ public class WSAlerts : MonoBehaviour
                     if (!string.IsNullOrEmpty(v)) token = v;
                 }
             }
-            catch { /* ignore */ }
+            catch
+            {
+                // ignore JSON invalide
+            }
         }
 
         switch (token)
@@ -156,17 +184,19 @@ public class WSAlerts : MonoBehaviour
             case "hippo":
                 ShowBlink(alertHippo);
                 break;
+
             case "jumanji1":
-                ShowBlink(alertJumanji1);
+            case "jumanji2":      // même image / même alerte
+                ShowBlink(alertJumanji);
                 break;
-            case "jumanji2":
-                ShowBlink(alertJumanji2);
-                break;
+
             case "stopalerte":
             case "stopalert":
             case "stop":
                 StopAllAlerts();
+                StopCommandReceived?.Invoke();
                 break;
+
             default:
                 if (logMessages) Debug.Log("[WS] unknown token: " + token);
                 break;
@@ -176,22 +206,39 @@ public class WSAlerts : MonoBehaviour
     // ------------- Blink / UI -------------
     void StopAllAlerts()
     {
-        if (_blinkCo != null) { StopCoroutine(_blinkCo); _blinkCo = null; }
+        if (_blinkCo != null)
+        {
+            StopCoroutine(_blinkCo);
+            _blinkCo = null;
+        }
         _currentCg = null;
 
         SetActive(alertHippo, false);
-        SetActive(alertJumanji1, false);
-        SetActive(alertJumanji2, false);
+        SetActive(alertJumanji, false);
+
+        // 🔥 Notifie que toutes les alertes sont stoppées
+        HippoAlertStopped?.Invoke();
+    }
+
+    public void ForceStopAlert(bool asCommand = false)
+    {
+        StopAllAlerts(); // coupe visuels + HippoAlertStopped
+
+        if (asCommand)
+        {
+            // On simule un vrai "stopAlerte" venant de Node-RED
+            StopCommandReceived?.Invoke();
+        }
     }
 
     void ShowBlink(GameObject go)
     {
         if (!go) return;
 
-        // d�sactive les autres, arr�te l'ancien clignotement
+        // Coupe ce qui était en cours
         StopAllAlerts();
 
-        // active le bon et lance le blink
+        // Active la nouvelle alerte et lance le clignotement
         SetActive(go, true);
         _currentCg = EnsureCanvasGroup(go);
         _currentCg.alpha = 1f;
@@ -201,17 +248,19 @@ public class WSAlerts : MonoBehaviour
     System.Collections.IEnumerator BlinkRoutine(CanvasGroup cg)
     {
         if (!cg) yield break;
-        float a1 = 1f;
-        float a2 = Mathf.Clamp01(dimAlpha);
+
+        float a1 = 1f;                             // 100%
+        float a2 = Mathf.Clamp01(dimAlpha);        // 50% (par défaut)
 
         while (cg && cg.gameObject.activeInHierarchy)
         {
+            // Toggle entre a1 et a2
             cg.alpha = (cg.alpha > (a1 + a2) * 0.5f) ? a2 : a1;
-            yield return new WaitForSeconds(blinkIntervalSec);
+            yield return new WaitForSeconds(blinkIntervalSec);   // toutes les 1s
         }
     }
 
-    // helpers
+    // Helpers
     static void SetActive(GameObject go, bool v)
     {
         if (go && go.activeSelf != v) go.SetActive(v);
