@@ -170,7 +170,17 @@ public class WSAlerts : MonoBehaviour
                 if (j != null)
                 {
                     var v = (j.alert ?? j.cmd ?? "").Trim().ToLowerInvariant();
-                    if (!string.IsNullOrEmpty(v)) token = v;
+
+                    if (!string.IsNullOrEmpty(v))
+                    {
+                        token = v;    // on a bien une alerte
+                    }
+                    else
+                    {
+                        // 👉 JSON sans champ alert/cmd (typiquement ID/Active/Phase) :
+                        // on l'ignore simplement, pas de "unknown token"
+                        return;
+                    }
                 }
             }
             catch
@@ -186,7 +196,7 @@ public class WSAlerts : MonoBehaviour
                 break;
 
             case "jumanji1":
-            case "jumanji2":      // même image / même alerte
+            case "jumanji2":
                 ShowBlink(alertJumanji);
                 break;
 

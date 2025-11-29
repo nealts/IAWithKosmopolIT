@@ -22,6 +22,8 @@ public class WSMissionsBoard : MonoBehaviour
     bool _hippoTriggeredOnce = false;
     bool _jumanjiTriggered = false;
     bool _jumanji1Triggered = false;
+    bool _jumanji2Triggered = false;
+
 
     [Header("WebSocket – Commands (start/done/reset) + outbound")]
     public string wsUrl = "ws://127.0.0.1:1880/ws/missions";
@@ -52,6 +54,7 @@ public class WSMissionsBoard : MonoBehaviour
     bool _kosmoCompleted = false;
     bool _hippoAlertTriggered = false;
     public static event System.Action Jumanji1Triggered;
+    public static event System.Action Jumanji2Triggered;
 
 
     enum RunState { Idle, Running, Done }
@@ -132,6 +135,10 @@ public class WSMissionsBoard : MonoBehaviour
             if (i < 5) { active = true; phase = 0; } // Phase 1
             else if (i < 10) { active = true; phase = 1; } // Phase 2
             else { active = false; phase = 0; } // désactivées
+
+            // 🔁 on synchronise aussi la “définition” visible dans l’Inspector
+            def.actif = active;
+            def.phase = (phase == 1);
 
             _rt[def.id] = new MissionRuntime
             {
@@ -535,13 +542,16 @@ public class WSMissionsBoard : MonoBehaviour
     [Serializable]
     class IaJson
     {
+        // Commandes génériques
         public int visibleActiveSlots;
         public string cmd;
         public int value;
-        public int ID;
-        public int Active;
-        public int Phase;
         public int startPhase;
+
+        // ⚠️ Format envoyé par Node-RED
+        public int ID;      // ex: 3
+        public int Active;  // 0 ou 1
+        public int Phase;   // 0 ou 1
     }
 
     void HandleIaMessage(string raw)
@@ -556,27 +566,35 @@ public class WSMissionsBoard : MonoBehaviour
                 var j = JsonUtility.FromJson<IaJson>(s);
                 if (j != null)
                 {
+                    // ---------- Mise à jour du nombre de slots visibles ----------
                     if (j.visibleActiveSlots >= 2 && j.visibleActiveSlots <= 4)
-                    { _main.Enqueue(() => ChangeVisibleSlots(j.visibleActiveSlots)); return; }
-
-                    if (!string.IsNullOrEmpty(j.cmd))
                     {
-                        var c = j.cmd.ToLowerInvariant();
-                        if (c.Contains("visible"))
-                        { _main.Enqueue(() => ChangeVisibleSlots(Mathf.Clamp(j.value, 2, 4))); return; }
-
-                        if (c.Contains("startphase"))
-                        { _main.Enqueue(() => BeginPhase(Mathf.Clamp(j.value, 0, 1))); return; }
+                        _main.Enqueue(() => ChangeVisibleSlots(j.visibleActiveSlots));
+                        return;
                     }
 
-                    if (j.startPhase == 0 || j.startPhase == 1)
-                    { _main.Enqueue(() => BeginPhase(j.startPhase)); return; }
+                    // ---------- Commande de phase ----------
+                    if (j.startPhase == 1 || j.startPhase == 2)
+                    {
+                        int phase01 = Mathf.Clamp(j.startPhase - 1, 0, 1);
+                        _main.Enqueue(() => BeginPhase(phase01));
+                        return;
+                    }
 
+                    // ---------- Mise à jour mission (ID / Active / Phase) ----------
                     if (j.ID > 0)
                     {
                         int idNum = j.ID;
-                        int? act = (j.Active == 0 || j.Active == 1) ? j.Active : (int?)null;
-                        int? ph = (j.Phase == 0 || j.Phase == 1) ? j.Phase : (int?)null;
+
+                        int? act = null;
+                        int? ph = null;
+
+                        if (j.Active == 0 || j.Active == 1)
+                            act = j.Active;
+
+                        if (j.Phase == 0 || j.Phase == 1)
+                            ph = j.Phase;
+
                         _main.Enqueue(() => ApplyMissionUpdateFromNode(idNum, act, ph));
                         return;
                     }
@@ -631,36 +649,136 @@ public class WSMissionsBoard : MonoBehaviour
 
     void ApplyMissionUpdateFromNode(int idNum, int? active, int? phase)
     {
-        string id = "m" + idNum.ToString("00");
-        if (!_rt.TryGetValue(id, out var r)) return;
+        Debug.LogWarning($"[TEST] ApplyMissionUpdateFromNode(idNum={idNum}, active={active}, phase={phase})");
+        // 1) On cherche d’abord le runtime par différentes clés
+        MissionRuntime r = null;
+        string id = null;
 
-        // si visible à l'écran → on ignore les modifs (verrou UX)
-        int visIndex = _active.IndexOf(id);
-        bool isVisible = visIndex >= 0 && visIndex < visibleActiveSlots;
-        if (isVisible)
+        // a) clé du genre "m01", "m02", etc.
+        string key1 = "m" + idNum.ToString("00");
+        if (_rt.TryGetValue(key1, out r))
         {
-            if (logMessages) Debug.Log($"[IA] update ignoré pour {id} (visible).");
+            id = key1;
+        }
+        else
+        {
+            // b) clé "1", "2", ...
+            string key2 = idNum.ToString();
+            if (_rt.TryGetValue(key2, out r))
+            {
+                id = key2;
+            }
+            else
+            {
+                // c) à défaut, on cherche par le champ number
+                r = _rt.Values.FirstOrDefault(rt => rt.number == idNum);
+                if (r != null)
+                    id = r.id;
+            }
+        }
+
+        if (r == null || string.IsNullOrEmpty(id))
+        {
+            if (logMessages) Debug.LogWarning($"[IA] mission inconnue pour idNum={idNum}");
             return;
         }
 
-        if (active.HasValue) r.active = (active.Value == 1);
-        if (phase.HasValue) r.phase = Mathf.Clamp(phase.Value, 0, 1);
+        if (r == null || string.IsNullOrEmpty(id))
+        {
+            if (logMessages) Debug.LogWarning($"[IA] mission inconnue pour idNum={idNum}");
+            return;
+        }
 
-        // mise à jour stricte de la queue + refill
+        //---------------------------------------------
+        // 🚫 Vérification : mission visible ?
+        //---------------------------------------------
+        bool isVisible = _active.Contains(id);
+        bool isDone = r.run == RunState.Done;
+
+        if (isVisible || isDone)
+        {
+            if (logMessages)
+                Debug.LogWarning($"[IA] Ignoré : Mission {id} visible ou déjà effectuée (visible={isVisible}, done={isDone})");
+            return; // ❌ interdiction de toucher une mission visible
+        }
+
+        if (logMessages)
+            Debug.Log($"[IA] update mission {id} (idNum={idNum}) - active={active}, phase={phase}");
+
+        // 2) On récupère la définition du catalogue (celle de l’Inspector)
+        var def = missions.FirstOrDefault(m => m.id == id);
+
+        if (logMessages)
+            Debug.Log($"[IA] MissionDef pour id={id} trouvée ? {(def != null)}");
+
+        // ---- ACTIVE ----
+        if (active.HasValue)
+        {
+            r.active = (active.Value == 1);
+
+            if (def != null)
+            {
+                def.actif = r.active;   // 👈 ça doit faire bouger le bool "Actif" dans l’Inspector
+                if (logMessages) Debug.Log($"[IA] def.actif pour {id} = {def.actif}");
+            }
+        }
+
+        // ---- PHASE ----
+        if (phase.HasValue)
+        {
+            r.phase = Mathf.Clamp(phase.Value, 0, 1);
+
+            if (def != null)
+            {
+                def.phase = (r.phase == 1);   // false = Phase 1, true = Phase 2
+                if (logMessages) Debug.Log($"[IA] def.phase pour {id} = {def.phase}");
+            }
+        }
+
+        // 3) Nettoyer la file pour la phase courante
         PurgeQueueForCurrentPhase();
 
-        // si éligible à la phase courante et pas déjà planifiée → ajouter
-        if (IsEligibleNow(id) && !_queue.Contains(id) && !_active.Contains(id))
+        // 4) Gestion de l’éligibilité
+        if (IsEligibleNow(id))
         {
-            if (_active.Count < visibleActiveSlots) { _active.Add(id); r.run = RunState.Running; }
-            else { _queue.Enqueue(id); r.run = RunState.Running; }
+            // Si elle n’est ni visible ni en file, on la place
+            if (!_active.Contains(id) && !_queue.Contains(id))
+            {
+                if (_active.Count < visibleActiveSlots)
+                {
+                    _active.Add(id);
+                    r.run = RunState.Running;
+                }
+                else
+                {
+                    _queue.Enqueue(id);
+                    r.run = RunState.Running;
+                }
+            }
         }
-        else if (!IsEligibleNow(id))
+        else
         {
+            // Plus éligible → on la retire de tout
             r.run = (r.run == RunState.Done) ? RunState.Done : RunState.Idle;
+
+            _active.Remove(id);
+
+            if (_queue.Contains(id))
+            {
+                var list = _queue.ToList();
+                list.RemoveAll(x => x == id);
+                _queue.Clear();
+                foreach (var x in list)
+                    _queue.Enqueue(x);
+            }
         }
 
+
+
+        // 5) On remplit à nouveau les slots visibles
         RefillActiveFromQueue();
+
+        // 6) On rafraîchit l’affichage (comme pour le slider Visible Active Slots)
         UpdateUI();
     }
 
@@ -688,6 +806,7 @@ public class WSMissionsBoard : MonoBehaviour
         KosmoGameManager.GameCompleted += OnFlagsGameCompleted;
         EnergyAlertController.HippoAlertTriggered += OnHippoAlertTriggered;
         WSAlerts.StopCommandReceived += OnStopCommandReceived;
+
     }
 
     void OnDisable()
@@ -842,6 +961,29 @@ public class WSMissionsBoard : MonoBehaviour
                     Debug.Log("[Missions] Jumanji1 déclenchée (pool Phase 1 vide).");
             }
         }
+        // ---------- Auto Jumanji2 ----------
+        // Si :
+        // - les missions sont débloquées
+        // - on est en Phase 2 (_currentPhase == 1)
+        // - plus aucune mission en cours ni en file d'attente
+        // - on ne l'a pas déjà déclenchée
+        if (!_jumanji2Triggered && _missionsUnlocked && _currentPhase == 1)
+        {
+            bool noActiveOrQueued = (_active.Count == 0 && _queue.Count == 0);
+            if (noActiveOrQueued && alerts)
+            {
+                _jumanji2Triggered = true;
+
+                // Lance l’alerte visuelle
+                alerts.HandleMessage("jumanji2");
+
+                // ➕ Préviens le système de debug / phases
+                Jumanji2Triggered?.Invoke();
+
+                if (logMessages)
+                    Debug.Log("[Missions] Jumanji2 déclenchée (pool Phase 2 vide).");
+            }
+        }
     }
 
     void ChangeVisibleSlots(int newCount)
@@ -878,6 +1020,10 @@ public class WSMissionsBoard : MonoBehaviour
         public string startAlias;
         public int number = 0;
         public string outMessage;
+
+        // 👇 les deux bool qui apparaissent dans le catalogue
+        public bool actif = true;   // 1 = active, 0 = désactivée
+        public bool phase;          // false = Phase 1, true = Phase 2
     }
 
     public static MissionDef[] DefaultMissions()

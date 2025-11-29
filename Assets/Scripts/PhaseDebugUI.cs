@@ -30,6 +30,8 @@ public class PhaseDebugUI : MonoBehaviour
 
         // Jumanji1 (via WSMissionsBoard)
         WSMissionsBoard.Jumanji1Triggered += OnJumanji1Triggered;
+        WSMissionsBoard.Jumanji2Triggered += OnJumanji2Triggered;
+
     }
 
     void OnDisable()
@@ -41,7 +43,16 @@ public class PhaseDebugUI : MonoBehaviour
         WSAlerts.StopCommandReceived -= OnAlertStopped;
 
         WSMissionsBoard.Jumanji1Triggered -= OnJumanji1Triggered;
+        WSMissionsBoard.Jumanji2Triggered -= OnJumanji2Triggered;
+
     }
+
+    void OnJumanji2Triggered()
+    {
+        SetText("Alerte Jumanji #2");
+        StopPhaseRoutine();
+    }
+
 
     // --------- KOSMO ---------
 
