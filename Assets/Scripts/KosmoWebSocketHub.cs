@@ -7,6 +7,13 @@ using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 
+/// <summary>
+/// Hub unique pour gérer plusieurs WebSockets (Node-RED).
+/// - Configure host/port une seule fois
+/// - Plusieurs endpoints nommés (ia, missions, kosmo, dna...)
+/// - Auto-reconnect
+/// - Dispatch des messages sur le main thread Unity
+/// </summary>
 public class KosmoWebSocketHub : MonoBehaviour
 {
     [Serializable]
@@ -32,6 +39,7 @@ public class KosmoWebSocketHub : MonoBehaviour
     [Header("Server")]
     public string host = "127.0.0.1";
     public int port = 1880;
+    [Tooltip("ws ou wss")]
     public string scheme = "ws";
 
     [Header("Endpoints")]
@@ -46,7 +54,8 @@ public class KosmoWebSocketHub : MonoBehaviour
     [Header("Debug")]
     public bool log = true;
 
-    public event Action<string, string> Message; // (endpointName, rawMessage)
+    /// <summary>(endpointName, rawMessage)</summary>
+    public event Action<string, string> Message;
 
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
     readonly Dictionary<string, Endpoint> _map = new Dictionary<string, Endpoint>(StringComparer.OrdinalIgnoreCase);
@@ -86,8 +95,8 @@ public class KosmoWebSocketHub : MonoBehaviour
     public bool IsConnected(string endpointName)
     {
         return _map.TryGetValue(endpointName, out var e)
-            && e.ws != null
-            && e.ws.State == WebSocketState.Open;
+               && e.ws != null
+               && e.ws.State == WebSocketState.Open;
     }
 
     public async Task Send(string endpointName, string text)
@@ -116,7 +125,10 @@ public class KosmoWebSocketHub : MonoBehaviour
         e.ws = new ClientWebSocket();
         e.cts = new CancellationTokenSource();
 
-        var url = !string.IsNullOrWhiteSpace(e.overrideUrl) ? e.overrideUrl.Trim() : $"{scheme}://{host}:{port}{e.path}";
+        var url = !string.IsNullOrWhiteSpace(e.overrideUrl)
+            ? e.overrideUrl.Trim()
+            : $"{scheme}://{host}:{port}{e.path}";
+
         try
         {
             if (log) Debug.Log($"[WS:{e.name}] Connecting {url}");
@@ -133,7 +145,6 @@ public class KosmoWebSocketHub : MonoBehaviour
 
     void RetryAll()
     {
-        // Reconnect seulement ceux qui ne sont pas déjà open
         foreach (var e in endpoints)
         {
             if (e == null) continue;
