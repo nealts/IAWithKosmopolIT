@@ -16,6 +16,8 @@ public class WSAlerts : MonoBehaviour
     public bool autoReconnect = true;
     public float reconnectDelaySec = 3f;
     public bool logMessages = true;
+    public KosmoWebSocketHub hub;
+    public string endpoint = "ia";
 
     [Header("Alert GameObjects")]
     public GameObject alertHippo;    // Alerte-hg
@@ -239,6 +241,22 @@ public class WSAlerts : MonoBehaviour
             // On simule un vrai "stopAlerte" venant de Node-RED
             StopCommandReceived?.Invoke();
         }
+    }
+
+    void OnEnable()
+    {
+        if (!hub) hub = FindAnyObjectByType<KosmoWebSocketHub>();
+        if (hub) hub.Message += OnHubMessage;
+    }
+    void OnDisable()
+    {
+        if (hub) hub.Message -= OnHubMessage;
+    }
+
+    void OnHubMessage(string ep, string raw)
+    {
+        if (!string.Equals(ep, endpoint, StringComparison.OrdinalIgnoreCase)) return;
+        HandleMessage(raw);
     }
 
     void ShowBlink(GameObject go)
