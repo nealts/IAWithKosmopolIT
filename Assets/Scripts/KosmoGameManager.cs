@@ -61,6 +61,7 @@ public class KosmoGameManager : MonoBehaviour
     bool _readyForQueuedSwitch = false;
     int? _queuedNextSeriesOneBased = null;
     bool _completionNotified = false;
+    KosmoNodeRedBridge _bridge;
 
     // overlays
     GameObject _bigCrossGO;
@@ -81,10 +82,15 @@ public class KosmoGameManager : MonoBehaviour
     public GameObject dna2D;
     public GameObject fakeDNA;
     public GameObject ProgressRoot;
+
+    //bypass GM
+    bool _seriesActive = false;
     // =================== LIFECYCLE ===================
 
     void Awake()
     {
+        _bridge = FindAnyObjectByType<KosmoNodeRedBridge>();
+        
         EnsureSeries();
         if (dna2D) dna2D.SetActive(false);
         // branchement des boutons
@@ -214,6 +220,7 @@ public class KosmoGameManager : MonoBehaviour
         if (!IsSeriesValid(s)) { Debug.LogError("[Kosmo] Invalid series."); return; }
 
         _currentSeriesIndex = sIndex;
+        _seriesActive = true;
 
         SetSlotsVisible(true);
         ClearFeedback();
@@ -243,6 +250,7 @@ public class KosmoGameManager : MonoBehaviour
         _readyForQueuedSwitch = false;
         yield return new WaitForSeconds(sec);
         _busy = false;
+        _seriesActive = false;
 
         if (_queuedNextSeriesOneBased.HasValue)
         {
@@ -256,6 +264,23 @@ public class KosmoGameManager : MonoBehaviour
             SetSlotsVisible(false);
             Debug.Log("[Kosmo] Waiting for next Son...");
         }
+    }
+
+    public void ForceCurrentSeriesSuccessByGM()
+    {
+        if (!_seriesActive)
+        {
+            Debug.Log("[Kosmo GM] No active series to validate.");
+            return;
+        }
+
+        if (_busy || _currentSeriesIndex < 0)
+            return;
+
+        Debug.Log("[Kosmo GM] SUCCESS GM triggered.");
+
+        // On appelle EXACTEMENT la même logique qu’un succès normal
+        OnExternalSuccess(0);
     }
 
     // =================== Feedback visuel ===================

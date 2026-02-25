@@ -12,8 +12,9 @@ public class WSAlerts : MonoBehaviour
     public static event System.Action StopCommandReceived;
     [Header("WebSocket")]
     [Tooltip("Endpoint Node-RED: ws://host:port/ws/ia")]
-    public string wsUrl = "ws://127.0.0.1:1880/ws/ia";
-    public bool autoReconnect = true;
+    [SerializeField] private WSChannel channel;
+    [SerializeField] private bool autoReconnect = true; // si tu avais déjà ce toggle, garde le tien
+    private string wsUrl;
     public float reconnectDelaySec = 3f;
     public bool logMessages = true;
     public KosmoWebSocketHub hub;
@@ -46,7 +47,38 @@ public class WSAlerts : MonoBehaviour
         SetActive(alertHippo, false);
         SetActive(alertJumanji, false);
 
+        if (WSConnectionsHub.Instance == null)
+        {
+            Debug.LogError("WSConnectionsHub not found in scene.");
+            return;
+        }
+
+        wsUrl = WSConnectionsHub.Instance.GetUrl(channel);
+
+        WSConnectionsHub.Instance.OnConfigChanged += HandleConfigChanged;
+
         Connect();
+    }
+
+    void HandleConfigChanged()
+    {
+        wsUrl = WSConnectionsHub.Instance.GetUrl(channel);
+
+        if (!autoReconnect) return;
+
+        Debug.Log("[WSAlerts] Config changed → reconnecting");
+
+        _main.Enqueue(async () =>
+        {
+            await CloseWS();
+            Connect();
+        });
+    }
+
+    void OnDestroy()
+    {
+        if (WSConnectionsHub.Instance != null)
+            WSConnectionsHub.Instance.OnConfigChanged -= HandleConfigChanged;
     }
 
     void Update()
@@ -120,7 +152,7 @@ public class WSAlerts : MonoBehaviour
                 } while (!res.EndOfMessage);
 
                 var msg = Encoding.UTF8.GetString(ms.ToArray());
-                if (logMessages) Debug.Log("[WS] <= " + msg);
+                //if (logMessages) Debug.Log("[WS] <= " + msg);
                 _main.Enqueue(() => HandleMessage(msg));
             }
             catch (Exception e)
@@ -259,6 +291,11 @@ public class WSAlerts : MonoBehaviour
         HandleMessage(raw);
     }
 
+    public void TriggerHippoFull()
+    {
+        ShowBlink(alertHippo);
+    }
+
     void ShowBlink(GameObject go)
     {
         if (!go) return;
@@ -279,6 +316,7 @@ public class WSAlerts : MonoBehaviour
 
         float a1 = 1f;                             // 100%
         float a2 = Mathf.Clamp01(dimAlpha);        // 50% (par défaut)
+
 
         while (cg && cg.gameObject.activeInHierarchy)
         {

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
@@ -9,8 +9,9 @@ using UnityEngine;
 public class KosmoNodeRedBridge : MonoBehaviour
 {
     [Header("WebSocket")]
-    public string wsUrl = "ws://127.0.0.1:1880/ws/kosmo";
-    public bool autoReconnect = true;
+    [SerializeField] private WSChannel channel;
+    [SerializeField] private bool autoReconnect = true; // si tu avais déjà ce toggle, garde le tien
+    private string wsUrl;
     public float reconnectDelaySec = 2f;
 
     [Header("Target")]
@@ -23,8 +24,41 @@ public class KosmoNodeRedBridge : MonoBehaviour
 
     void Start()
     {
-        if (!gameManager) gameManager = FindAnyObjectByType<KosmoGameManager>();
+        if (!gameManager)
+            gameManager = FindAnyObjectByType<KosmoGameManager>();
+
+        if (WSConnectionsHub.Instance == null)
+        {
+            Debug.LogError("WSConnectionsHub not found in scene.");
+            return;
+        }
+
+        wsUrl = WSConnectionsHub.Instance.GetUrl(channel);
+
+        WSConnectionsHub.Instance.OnConfigChanged += HandleConfigChanged;
+
         _ = Connect();
+    }
+
+    void OnDestroy()
+    {
+        if (WSConnectionsHub.Instance != null)
+            WSConnectionsHub.Instance.OnConfigChanged -= HandleConfigChanged;
+    }
+
+    void HandleConfigChanged()
+    {
+        wsUrl = WSConnectionsHub.Instance.GetUrl(channel);
+
+        if (!autoReconnect) return;
+
+        Debug.Log("[Bridge] Config changed → reconnecting");
+
+        _main.Enqueue(async () =>
+        {
+            await CloseWS();
+            _ = Connect();
+        });
     }
 
     void Update()
@@ -95,10 +129,38 @@ public class KosmoNodeRedBridge : MonoBehaviour
         if (!_closing && autoReconnect) _main.Enqueue(() => Invoke(nameof(RetryConnect), reconnectDelaySec));
     }
 
+    public async void SendKosmoRingEnd()
+    {
+        if (_ws == null || _ws.State != System.Net.WebSockets.WebSocketState.Open)
+        {
+            Debug.LogWarning("[Bridge] Cannot send Kosmo_Ring_End (not connected)");
+            return;
+        }
+
+        var data = Encoding.UTF8.GetBytes("Kosmo_Ring_End");
+        var seg = new ArraySegment<byte>(data);
+
+        try
+        {
+            await _ws.SendAsync(seg, WebSocketMessageType.Text, true, _cts.Token);
+            Debug.Log("[Bridge] => Kosmo_Ring_End");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[Bridge] Send error: " + e.Message);
+        }
+    }
+
     void Handle(string msg)
     {
+
         msg = msg.Trim();
         Debug.Log("[Bridge] RX: " + msg);
+        if (msg.Trim().Equals("succes gm", StringComparison.OrdinalIgnoreCase))
+        {
+            _main.Enqueue(() => gameManager?.ForceCurrentSeriesSuccessByGM());
+            return;
+        }
 
         // --- JSON ? ---
         try

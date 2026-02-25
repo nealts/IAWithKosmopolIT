@@ -26,12 +26,14 @@ public class WSMissionsBoard : MonoBehaviour
 
 
     [Header("WebSocket – Commands (start/done/reset) + outbound")]
-    public string wsUrl = "ws://127.0.0.1:1880/ws/missions";
-    public bool autoReconnect = true;
+    [SerializeField] private WSChannel channel;
+    [SerializeField] private bool autoReconnect = true; // si tu avais déjà ce toggle, garde le tien
+    private string wsUrl;
     public float reconnectDelaySec = 3f;
 
     [Header("WebSocket – IA (runtime params & mission states)")]
-    public string wsUrlIa = "ws://127.0.0.1:1880/ws/ia";
+    [SerializeField] private WSChannel iaChannel = WSChannel.Alerts;
+    private string wsUrlIa;
 
     [Header("UI - Réparations en cours (4 slots max dans la scène)")]
     public TextMeshProUGUI[] ongoingSlots = new TextMeshProUGUI[4];
@@ -109,6 +111,7 @@ public class WSMissionsBoard : MonoBehaviour
         }
 
         // Surtout : on NE fait PAS RebuildFromRuntime ici.
+        RefreshWsUrls();
         ConnectCmd();
         ConnectIa();
     }
@@ -151,6 +154,36 @@ public class WSMissionsBoard : MonoBehaviour
         }
     }
 
+
+
+    void RefreshWsUrls()
+    {
+        var hub = WSConnectionsHub.Instance;
+        if (hub == null)
+        {
+            Debug.LogError("WSConnectionsHub not found in scene.");
+            return;
+        }
+
+        wsUrl = hub.GetUrl(channel);
+        wsUrlIa = hub.GetUrl(iaChannel);
+    }
+
+    async void HandleHubConfigChanged()
+    {
+        RefreshWsUrls();
+
+        if (!autoReconnect) return;
+        if (_closing) return;
+
+        if (logMessages)
+            Debug.Log("[WS] Hub config changed → full reconnect");
+
+        await CloseAllWS();
+
+        ConnectCmd();
+        ConnectIa();
+    }
 
     void Update()
     {
@@ -496,7 +529,7 @@ public class WSMissionsBoard : MonoBehaviour
     void HandleCmdMessage(string raw)
     {
         if (logMessages) Debug.Log("[WS-cmd] <= " + raw);
-
+        if (raw.Trim().Equals("Mission 6", StringComparison.OrdinalIgnoreCase)) _main.Enqueue(() => GameObject.Find("Background Idle")?.SetActive(false));
         string intent = null; // start|done|reset
         string token = null;
 
@@ -527,14 +560,15 @@ public class WSMissionsBoard : MonoBehaviour
                 case "reset": ResetBoard(); break;
                 case "start":
                     if (TryResolveMissionId(token, out var idStart)) StartMission(idStart);
-                    else Debug.LogWarning("[WS-cmd] start: mission introuvable pour token='" + token + "'");
+                    else Debug.LogWarning("[WS-MissionBoard] start: mission introuvable pour token='" + token + "'");
                     break;
                 case "done":
                     if (TryResolveMissionId(token, out var idDone)) CompleteMission(idDone);
-                    else Debug.LogWarning("[WS-cmd] done: mission introuvable pour token='" + token + "'");
+                    else Debug.LogWarning("[WS-MissionBoard] done: mission introuvable pour token='" + token + "'");
                     break;
                 default:
-                    Debug.Log("[WS-cmd] Message ignoré (format invalide)."); break;
+                    //Debug.Log("[WS-MissionBoard] Message ignoré (format invalide).");
+                    break;
             }
         });
     }
@@ -556,7 +590,7 @@ public class WSMissionsBoard : MonoBehaviour
 
     void HandleIaMessage(string raw)
     {
-        if (logMessages) Debug.Log("[WS-ia] <= " + raw);
+        if (logMessages) Debug.Log("[WS-MissionBoard] <= " + raw);
         var s = raw.Trim();
 
         if (s.StartsWith("{"))
@@ -806,6 +840,9 @@ public class WSMissionsBoard : MonoBehaviour
         KosmoGameManager.GameCompleted += OnFlagsGameCompleted;
         EnergyAlertController.HippoAlertTriggered += OnHippoAlertTriggered;
         WSAlerts.StopCommandReceived += OnStopCommandReceived;
+        if (WSConnectionsHub.Instance != null)
+            WSConnectionsHub.Instance.OnConfigChanged += HandleHubConfigChanged;
+
 
     }
 
@@ -814,13 +851,21 @@ public class WSMissionsBoard : MonoBehaviour
         KosmoGameManager.GameCompleted -= OnFlagsGameCompleted;
         EnergyAlertController.HippoAlertTriggered -= OnHippoAlertTriggered;
         WSAlerts.StopCommandReceived -= OnStopCommandReceived;
+        if (WSConnectionsHub.Instance != null)
+            WSConnectionsHub.Instance.OnConfigChanged -= HandleHubConfigChanged;
+
     }
 
     void OnFlagsGameCompleted()
     {
-        // Kosmo gagné (4/4)
         _kosmoCompleted = true;
-        if (logMessages) Debug.Log("[Missions] Kosmo complété (4/4).");
+
+        if (logMessages)
+            Debug.Log("[Missions] Kosmo complété (4/4).");
+
+        // 🔥 Envoi vers Node-RED sur topic kosmo
+        FindAnyObjectByType<KosmoNodeRedBridge>()?.SendKosmoRingEnd();
+
         TryUnlockPhase1Missions();
     }
 

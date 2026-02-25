@@ -18,8 +18,9 @@ public class WSProgressBridge : MonoBehaviour
 {
     [Header("WebSocket")]
     [Tooltip("Exemple: ws://127.0.0.1:1880/ws/dna")]
-    public string wsUrl = "ws://127.0.0.1:1880/ws/dna";
-    public bool autoReconnect = true;
+    [SerializeField] private WSChannel channel;
+    [SerializeField] private bool autoReconnect = true; // si tu avais déjà ce toggle, garde le tien
+    private string wsUrl;
     public float reconnectDelaySec = 3f;
 
     [Header("Cible")]
@@ -35,8 +36,41 @@ public class WSProgressBridge : MonoBehaviour
 
     void Start()
     {
-        if (!animator) animator = FindAnyObjectByType<DNA2DAnimator>();
+        if (!animator)
+            animator = FindAnyObjectByType<DNA2DAnimator>();
+
+        if (WSConnectionsHub.Instance == null)
+        {
+            Debug.LogError("WSConnectionsHub not found in scene.");
+            return;
+        }
+
+        wsUrl = WSConnectionsHub.Instance.GetUrl(channel);
+
+        WSConnectionsHub.Instance.OnConfigChanged += HandleConfigChanged;
+
         Connect();
+    }
+
+    void HandleConfigChanged()
+    {
+        wsUrl = WSConnectionsHub.Instance.GetUrl(channel);
+
+        if (!autoReconnect) return;
+
+        Debug.Log("[WS] Config changed → reconnecting");
+
+        _main.Enqueue(async () =>
+        {
+            await CloseWS();
+            Connect();
+        });
+    }
+
+    void OnDestroy()
+    {
+        if (WSConnectionsHub.Instance != null)
+            WSConnectionsHub.Instance.OnConfigChanged -= HandleConfigChanged;
     }
 
     void Update()
