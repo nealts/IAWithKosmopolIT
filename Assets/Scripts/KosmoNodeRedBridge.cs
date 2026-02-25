@@ -1,25 +1,30 @@
 using System;
 using System.Collections.Concurrent;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 public class KosmoNodeRedBridge : MonoBehaviour
 {
-    [Header("WebSocket Hub")]
-    public KosmoWebSocketHub hub;
-    [Tooltip("Nom d'endpoint dans le Hub (ex: kosmo)")]
-    public string endpoint = "kosmo";
+    [Header("WebSocket")]
+    public string wsUrl = "ws://127.0.0.1:1880/ws/kosmo";
+    public bool autoReconnect = true;
+    public float reconnectDelaySec = 2f;
 
     [Header("Target")]
     public KosmoGameManager gameManager;
 
+    ClientWebSocket _ws;
+    CancellationTokenSource _cts;
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
+    bool _closing;
 
     void Start()
     {
         if (!gameManager) gameManager = FindAnyObjectByType<KosmoGameManager>();
-
-        EnsureHub();
-        if (hub != null) hub.Message += OnHubMessage;
+        _ = Connect();
     }
 
     void Update()
@@ -27,32 +32,72 @@ public class KosmoNodeRedBridge : MonoBehaviour
         while (_main.TryDequeue(out var a)) a?.Invoke();
     }
 
-    void OnDisable()
+    async Task Connect()
     {
-        if (hub != null) hub.Message -= OnHubMessage;
+        await CloseWS();
+        _ws = new ClientWebSocket();
+        _cts = new CancellationTokenSource();
+
+        try
+        {
+            Debug.Log("[Bridge] Connecting " + wsUrl);
+            await _ws.ConnectAsync(new Uri(wsUrl), _cts.Token);
+            Debug.Log("[Bridge] Connected");
+            _ = Task.Run(RecvLoop);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[Bridge] Connect failed: " + e.Message);
+            if (autoReconnect) Invoke(nameof(RetryConnect), reconnectDelaySec);
+        }
     }
 
-    void OnApplicationQuit()
+    void RetryConnect()
     {
-        if (hub != null) hub.Message -= OnHubMessage;
+        if (!_closing) _ = Connect();
     }
 
-    void EnsureHub()
+    async Task RecvLoop()
     {
-        if (hub == null) hub = FindAnyObjectByType<KosmoWebSocketHub>();
-    }
+        var buf = new ArraySegment<byte>(new byte[2048]);
 
-    void OnHubMessage(string ep, string raw)
-    {
-        if (!string.Equals(ep, endpoint, StringComparison.OrdinalIgnoreCase)) return;
-        Handle(raw);
+        while (_ws != null && _ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+        {
+            WebSocketReceiveResult res = null;
+            var ms = new System.IO.MemoryStream();
+
+            try
+            {
+                do
+                {
+                    res = await _ws.ReceiveAsync(buf, _cts.Token);
+                    if (res.MessageType == WebSocketMessageType.Close)
+                    {
+                        Debug.Log("[Bridge] Server requested close");
+                        await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", _cts.Token);
+                        break;
+                    }
+                    ms.Write(buf.Array, buf.Offset, res.Count);
+                }
+                while (!res.EndOfMessage);
+
+                var raw = Encoding.UTF8.GetString(ms.ToArray());
+                Handle(raw);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[Bridge] Recv error: " + e.Message);
+                break;
+            }
+            finally { ms.Dispose(); }
+        }
+
+        if (!_closing && autoReconnect) _main.Enqueue(() => Invoke(nameof(RetryConnect), reconnectDelaySec));
     }
 
     void Handle(string msg)
     {
-        msg = (msg ?? "").Trim();
-        if (msg.Length == 0) return;
-
+        msg = msg.Trim();
         Debug.Log("[Bridge] RX: " + msg);
 
         // --- JSON ? ---
@@ -88,13 +133,10 @@ public class KosmoNodeRedBridge : MonoBehaviour
                 }
             }
         }
-        catch (Exception ex)
-        {
-            Debug.Log("[Bridge] JSON parse fail: " + ex.Message);
-        }
+        catch (Exception ex) { Debug.Log("[Bridge] JSON parse fail: " + ex.Message); }
 
         // --- Texte brut ---
-        var lower = msg.ToLowerInvariant();
+        var lower = msg.ToLower();
 
         if (lower.StartsWith("forcewin"))
         {
@@ -156,13 +198,29 @@ public class KosmoNodeRedBridge : MonoBehaviour
     {
         s = s.Trim();
         if (s.StartsWith("{")) return s;
-
-        var low = s.ToLowerInvariant();
-        if (low.StartsWith("success")) { var n = ExtractInt(low); return "{\"success\":" + n + "}"; }
-        if (low.StartsWith("fail")) return "{\"fail\":true}";
-        if (low.StartsWith("son")) { var n = ExtractInt(low); return "{\"son\":" + n + "}"; }
-        if (low.StartsWith("forcewin")) return "{\"forceWin\":true}";
-
+        if (s.ToLower().StartsWith("success")) { var n = ExtractInt(s.ToLower()); return "{\"success\":" + n + "}"; }
+        if (s.ToLower().StartsWith("fail")) { return "{\"fail\":true}"; }
+        if (s.ToLower().StartsWith("son")) { var n = ExtractInt(s.ToLower()); return "{\"son\":" + n + "}"; }
+        if (s.ToLower().StartsWith("forcewin")) { return "{\"forceWin\":true}"; }
         return "{}";
     }
+
+    async Task CloseWS()
+    {
+        try
+        {
+            _closing = true;
+            _cts?.Cancel();
+            if (_ws != null)
+            {
+                if (_ws.State == WebSocketState.Open)
+                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None);
+                _ws.Dispose();
+            }
+        }
+        catch { }
+        finally { _ws = null; _cts = null; _closing = false; }
+    }
+
+    async void OnApplicationQuit() { await CloseWS(); }
 }

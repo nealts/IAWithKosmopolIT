@@ -1,10 +1,13 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 
 /// <summary>
-/// Reçoit des commandes depuis Node-RED via WebSocket (via Hub) et pilote DNA2DAnimator.
+/// Reçoit des commandes depuis Node-RED via WebSocket et pilote DNA2DAnimator.
 /// Messages JSON attendus:
 /// { "cmd":"increase", "value":5 }     // +5%
 /// { "cmd":"decrease", "value":3 }     // -3%
@@ -13,21 +16,27 @@ using UnityEngine;
 /// </summary>
 public class WSProgressBridge : MonoBehaviour
 {
-    [Header("WebSocket Hub")]
-    public KosmoWebSocketHub hub;
-    [Tooltip("Nom d'endpoint dans le Hub (ex: dna)")]
-    public string endpoint = "dna";
+    [Header("WebSocket")]
+    [Tooltip("Exemple: ws://127.0.0.1:1880/ws/dna")]
+    public string wsUrl = "ws://127.0.0.1:1880/ws/dna";
+    public bool autoReconnect = true;
+    public float reconnectDelaySec = 3f;
 
     [Header("Cible")]
     public DNA2DAnimator animator;          // drag & drop ton composant
     [Tooltip("Si 'value' non fourni dans le message, on utilise ce pas (en %)")]
     public float defaultStepPercent = 5f;
 
+    ClientWebSocket _ws;
+    CancellationTokenSource _cts;
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
+    Task _recvTask;
+    bool _closing;
 
     void Start()
     {
         if (!animator) animator = FindAnyObjectByType<DNA2DAnimator>();
+        Connect();
     }
 
     void Update()
@@ -35,27 +44,67 @@ public class WSProgressBridge : MonoBehaviour
         while (_main.TryDequeue(out var a)) a?.Invoke();
     }
 
-    // ---------- WebSocket Hub bindings ----------
-    void EnsureHub()
+    async void Connect()
     {
-        if (hub == null) hub = FindAnyObjectByType<KosmoWebSocketHub>();
+        await CloseWS();
+
+        _ws = new ClientWebSocket();
+        _cts = new CancellationTokenSource();
+
+        try
+        {
+            Debug.Log("[WS] Connecting " + wsUrl);
+            await _ws.ConnectAsync(new Uri(wsUrl), _cts.Token);
+            Debug.Log("[WS] Connected");
+            _recvTask = Task.Run(RecvLoop);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[WS] Connect failed: " + e.Message);
+            if (autoReconnect) Invoke(nameof(RetryConnect), reconnectDelaySec);
+        }
     }
 
-    void OnEnable()
+    void RetryConnect()
     {
-        EnsureHub();
-        if (hub != null) hub.Message += OnHubMessage;
+        if (!_closing) Connect();
     }
 
-    void OnDisable()
+    async Task RecvLoop()
     {
-        if (hub != null) hub.Message -= OnHubMessage;
-    }
+        var buf = new ArraySegment<byte>(new byte[4096]);
 
-    void OnHubMessage(string ep, string raw)
-    {
-        if (!string.Equals(ep, endpoint, StringComparison.OrdinalIgnoreCase)) return;
-        HandleMessage(raw);
+        while (_ws != null && _ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+        {
+            WebSocketReceiveResult res = null;
+            var ms = new System.IO.MemoryStream();
+
+            try
+            {
+                do
+                {
+                    res = await _ws.ReceiveAsync(buf, _cts.Token);
+                    if (res.MessageType == WebSocketMessageType.Close)
+                    {
+                        await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", _cts.Token);
+                        break;
+                    }
+                    ms.Write(buf.Array, buf.Offset, res.Count);
+                }
+                while (!res.EndOfMessage);
+
+                var msg = Encoding.UTF8.GetString(ms.ToArray());
+                HandleMessage(msg);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[WS] Recv error: " + e.Message);
+                break;
+            }
+            finally { ms.Dispose(); }
+        }
+
+        if (!_closing && autoReconnect) _main.Enqueue(() => Invoke(nameof(RetryConnect), reconnectDelaySec));
     }
 
     void HandleMessage(string msg)
@@ -66,7 +115,8 @@ public class WSProgressBridge : MonoBehaviour
 
         try
         {
-            var j = JsonUtility.FromJson<Msg>(Wrap(msg));
+            // mini parseur sans dépendance
+            var j = JsonUtility.FromJson<Msg>(Wrap(msg)); // Wrap: JsonUtility veut un root unique
             cmd = j.cmd;
             val = j.value;
         }
@@ -92,7 +142,7 @@ public class WSProgressBridge : MonoBehaviour
                 case "increase":
                 case "inc":
                 case "+":
-                    animator.IncreaseBy(step);
+                    animator.IncreaseBy(step);   // accepte % ou 0..1
                     break;
 
                 case "decrease":
@@ -119,16 +169,39 @@ public class WSProgressBridge : MonoBehaviour
     // envoie une petite réponse (debug)
     public async Task SendText(string text)
     {
-        EnsureHub();
-        if (hub == null) return;
-        await hub.Send(endpoint, text);
+        if (_ws == null || _ws.State != WebSocketState.Open) return;
+        var data = Encoding.UTF8.GetBytes(text);
+        var seg = new ArraySegment<byte>(data);
+        try { await _ws.SendAsync(seg, WebSocketMessageType.Text, true, _cts.Token); }
+        catch (Exception e) { Debug.LogWarning("[WS] Send error: " + e.Message); }
     }
 
+    async Task CloseWS()
+    {
+        try
+        {
+            _closing = true;
+            _cts?.Cancel();
+            if (_ws != null)
+            {
+                if (_ws.State == WebSocketState.Open)
+                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None);
+                _ws.Dispose();
+            }
+        }
+        catch { }
+        finally { _ws = null; _cts = null; _recvTask = null; _closing = false; }
+    }
+
+    async void OnApplicationQuit() { await CloseWS(); }
+
     // ----- helpers JSON -----
+    // JsonUtility nécessite un objet root ; on enveloppe si besoin.
     [Serializable] class Msg { public string cmd; public float value; }
     string Wrap(string s)
     {
+        // si s commence par { "cmd": … } c'est déjà bon ; sinon on essaie tel quel
         if (s.TrimStart().StartsWith("{")) return s;
-        return s;
+        return s; // on laisse la voie texte libre ; le try/catch gère
     }
 }

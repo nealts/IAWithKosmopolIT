@@ -55,7 +55,6 @@ public class MatrixRainController : MonoBehaviour
     private readonly List<MatrixColumn> pool = new();
     private float pixelPerLine;
 
-    [System.Obsolete]
     void Awake()
     {
         // Force a local Canvas with low sorting order so this effect goes behind the rest.
@@ -104,7 +103,6 @@ public class MatrixRainController : MonoBehaviour
     }
 
     [ContextMenu("Rebuild")]
-    [System.Obsolete]
     public void Build()
     {
         foreach (var c in pool) if (c) Destroy(c.gameObject);
@@ -124,7 +122,6 @@ public class MatrixRainController : MonoBehaviour
         }
     }
 
-    [System.Obsolete]
     private MatrixColumn CreateColumn(float localX)
     {
         var go = new GameObject("MatrixColumn", typeof(RectTransform));

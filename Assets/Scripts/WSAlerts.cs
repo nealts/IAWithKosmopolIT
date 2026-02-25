@@ -1,24 +1,38 @@
 ﻿using System;
+using System.Collections.Concurrent;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 
 public class WSAlerts : MonoBehaviour
 {
-    public static event Action HippoAlertStopped;
-    public static event Action StopCommandReceived;
-
-    [Header("WebSocket Hub")]
-    public KosmoWebSocketHub hub;
-    [Tooltip("Nom d'endpoint dans le Hub (ex: ia)")]
-    public string endpoint = "ia";
+    public static event System.Action HippoAlertStopped;
+    public static event System.Action StopCommandReceived;
+    [Header("WebSocket")]
+    [Tooltip("Endpoint Node-RED: ws://host:port/ws/ia")]
+    public string wsUrl = "ws://127.0.0.1:1880/ws/ia";
+    public bool autoReconnect = true;
+    public float reconnectDelaySec = 3f;
     public bool logMessages = true;
+    public KosmoWebSocketHub hub;
+    public string endpoint = "ia";
 
     [Header("Alert GameObjects")]
     public GameObject alertHippo;    // Alerte-hg
     public GameObject alertJumanji;  // Alerte-j (utilisée pour jumanji1 + jumanji2)
 
     [Header("Blink settings")]
-    [Range(0.1f, 5f)] public float blinkIntervalSec = 1f;
-    [Range(0f, 1f)] public float dimAlpha = 0.5f;
+    [Range(0.1f, 5f)] public float blinkIntervalSec = 1f;  // 1s entre chaque changement
+    [Range(0f, 1f)] public float dimAlpha = 0.5f;          // 50% d'opacité
+
+    // --- runtime ---
+    ClientWebSocket _ws;
+    CancellationTokenSource _cts;
+    Task _recvTask;
+    bool _closing;
+    readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
 
     Coroutine _blinkCo;
     CanvasGroup _currentCg;
@@ -28,39 +42,44 @@ public class WSAlerts : MonoBehaviour
 
     void Start()
     {
+        // Désactive toutes les alertes au lancement
         SetActive(alertHippo, false);
         SetActive(alertJumanji, false);
 
-        EnsureHub();
-        if (hub != null) hub.Message += OnHubMessage;
+        Connect();
     }
 
-    void OnDisable()
+    void Update()
     {
-        if (hub != null) hub.Message -= OnHubMessage;
+        while (_main.TryDequeue(out var a)) a?.Invoke();
     }
 
-    void OnApplicationQuit()
+    void OnApplicationQuit() => _ = CloseWS();
+
+    // ------------- WebSocket infra -------------
+    async void Connect()
     {
-        if (hub != null) hub.Message -= OnHubMessage;
+        await CloseWS();
+        _ws = new ClientWebSocket();
+        _cts = new CancellationTokenSource();
+
+        try
+        {
+            if (logMessages) Debug.Log("[WS] Connecting " + wsUrl);
+            await _ws.ConnectAsync(new Uri(wsUrl), _cts.Token);
+            if (logMessages) Debug.Log("[WS] Connected");
+            _recvTask = Task.Run(RecvLoop);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[WS] Connect failed: " + e.Message);
+            if (autoReconnect) Invoke(nameof(RetryConnect), reconnectDelaySec);
+        }
     }
 
-    void EnsureHub()
-    {
-        if (hub == null) hub = FindAnyObjectByType<KosmoWebSocketHub>();
-    }
-
-    void OnHubMessage(string ep, string raw)
-    {
-        if (!string.Equals(ep, endpoint, StringComparison.OrdinalIgnoreCase)) return;
-        if (logMessages) Debug.Log("[WS:" + endpoint + "] <= " + raw);
-        HandleMessage(raw);
-    }
-
-    // ✅ Gardé public (WSMissionsBoard l'utilise)
     public void SendManualAlert(string token)
     {
-        switch ((token ?? "").ToLowerInvariant())
+        switch (token.ToLowerInvariant())
         {
             case "hippo":
                 ShowBlink(alertHippo);
@@ -73,10 +92,76 @@ public class WSAlerts : MonoBehaviour
         }
     }
 
-    // ✅ Gardé public (WSMissionsBoard l'utilise)
+
+    void RetryConnect()
+    {
+        if (!_closing) Connect();
+    }
+
+    async Task RecvLoop()
+    {
+        var buf = new ArraySegment<byte>(new byte[4096]);
+
+        while (_ws != null && _ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+        {
+            WebSocketReceiveResult res = null;
+            var ms = new System.IO.MemoryStream();
+            try
+            {
+                do
+                {
+                    res = await _ws.ReceiveAsync(buf, _cts.Token);
+                    if (res.MessageType == WebSocketMessageType.Close)
+                    {
+                        await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", _cts.Token);
+                        break;
+                    }
+                    ms.Write(buf.Array, buf.Offset, res.Count);
+                } while (!res.EndOfMessage);
+
+                var msg = Encoding.UTF8.GetString(ms.ToArray());
+                if (logMessages) Debug.Log("[WS] <= " + msg);
+                _main.Enqueue(() => HandleMessage(msg));
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[WS] Recv error: " + e.Message);
+                break;
+            }
+            finally { ms.Dispose(); }
+        }
+
+        if (!_closing && autoReconnect)
+            _main.Enqueue(() => Invoke(nameof(RetryConnect), reconnectDelaySec));
+    }
+
+    async Task CloseWS()
+    {
+        try
+        {
+            _closing = true;
+            _cts?.Cancel();
+            if (_ws != null)
+            {
+                if (_ws.State == WebSocketState.Open)
+                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None);
+                _ws.Dispose();
+            }
+        }
+        catch { }
+        finally
+        {
+            _ws = null;
+            _cts = null;
+            _recvTask = null;
+            _closing = false;
+        }
+    }
+
+    // ------------- Messages -------------
     public void HandleMessage(string raw)
     {
-        string token = (raw ?? "").Trim().ToLowerInvariant();
+        string token = raw.Trim().ToLowerInvariant();
 
         // Support JSON simple { "alert":"hippo" } / { "cmd":"hippo" }
         if (token.StartsWith("{") && token.EndsWith("}"))
@@ -87,11 +172,23 @@ public class WSAlerts : MonoBehaviour
                 if (j != null)
                 {
                     var v = (j.alert ?? j.cmd ?? "").Trim().ToLowerInvariant();
-                    if (!string.IsNullOrEmpty(v)) token = v;
-                    else return; // JSON sans alert/cmd => ignore
+
+                    if (!string.IsNullOrEmpty(v))
+                    {
+                        token = v;    // on a bien une alerte
+                    }
+                    else
+                    {
+                        // 👉 JSON sans champ alert/cmd (typiquement ID/Active/Phase) :
+                        // on l'ignore simplement, pas de "unknown token"
+                        return;
+                    }
                 }
             }
-            catch { /* ignore */ }
+            catch
+            {
+                // ignore JSON invalide
+            }
         }
 
         switch (token)
@@ -113,11 +210,12 @@ public class WSAlerts : MonoBehaviour
                 break;
 
             default:
-                if (logMessages) Debug.Log("[WSAlerts] unknown token: " + token);
+                if (logMessages) Debug.Log("[WS] unknown token: " + token);
                 break;
         }
     }
 
+    // ------------- Blink / UI -------------
     void StopAllAlerts()
     {
         if (_blinkCo != null)
@@ -130,47 +228,78 @@ public class WSAlerts : MonoBehaviour
         SetActive(alertHippo, false);
         SetActive(alertJumanji, false);
 
+        // 🔥 Notifie que toutes les alertes sont stoppées
         HippoAlertStopped?.Invoke();
+    }
+
+    public void ForceStopAlert(bool asCommand = false)
+    {
+        StopAllAlerts(); // coupe visuels + HippoAlertStopped
+
+        if (asCommand)
+        {
+            // On simule un vrai "stopAlerte" venant de Node-RED
+            StopCommandReceived?.Invoke();
+        }
+    }
+
+    void OnEnable()
+    {
+        if (!hub) hub = FindAnyObjectByType<KosmoWebSocketHub>();
+        if (hub) hub.Message += OnHubMessage;
+    }
+    void OnDisable()
+    {
+        if (hub) hub.Message -= OnHubMessage;
+    }
+
+    void OnHubMessage(string ep, string raw)
+    {
+        if (!string.Equals(ep, endpoint, StringComparison.OrdinalIgnoreCase)) return;
+        HandleMessage(raw);
     }
 
     void ShowBlink(GameObject go)
     {
+        if (!go) return;
+
+        // Coupe ce qui était en cours
         StopAllAlerts();
 
-        if (!go) return;
+        // Active la nouvelle alerte et lance le clignotement
         SetActive(go, true);
-
-        _currentCg = go.GetComponent<CanvasGroup>();
-        if (!_currentCg) _currentCg = go.AddComponent<CanvasGroup>();
-
+        _currentCg = EnsureCanvasGroup(go);
+        _currentCg.alpha = 1f;
         _blinkCo = StartCoroutine(BlinkRoutine(_currentCg));
     }
 
     System.Collections.IEnumerator BlinkRoutine(CanvasGroup cg)
     {
-        bool dim = false;
-        while (true)
+        if (!cg) yield break;
+
+        float a1 = 1f;                             // 100%
+        float a2 = Mathf.Clamp01(dimAlpha);        // 50% (par défaut)
+
+        while (cg && cg.gameObject.activeInHierarchy)
         {
-            dim = !dim;
-            if (cg) cg.alpha = dim ? dimAlpha : 1f;
-            yield return new WaitForSeconds(blinkIntervalSec);
+            // Toggle entre a1 et a2
+            cg.alpha = (cg.alpha > (a1 + a2) * 0.5f) ? a2 : a1;
+            yield return new WaitForSeconds(blinkIntervalSec);   // toutes les 1s
         }
     }
 
-    public void ForceStopAlert() => StopAllAlerts();
-
-    // Si certains scripts appellent ForceStopAlert(bool)
-    // Compat totale avec anciens appels
-    public void ForceStopAlert(bool asCommand = false)
+    // Helpers
+    static void SetActive(GameObject go, bool v)
     {
-        StopAllAlerts();
-
-        if (asCommand)
-            StopCommandReceived?.Invoke();
+        if (go && go.activeSelf != v) go.SetActive(v);
+        var cg = go ? go.GetComponent<CanvasGroup>() : null;
+        if (v && cg) cg.alpha = 1f;
     }
 
-    static void SetActive(GameObject go, bool active)
+    static CanvasGroup EnsureCanvasGroup(GameObject go)
     {
-        if (go && go.activeSelf != active) go.SetActive(active);
+        var cg = go.GetComponent<CanvasGroup>();
+        if (!cg) cg = go.AddComponent<CanvasGroup>();
+        return cg;
     }
 }

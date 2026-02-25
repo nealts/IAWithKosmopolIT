@@ -23,7 +23,7 @@ public class KosmoGameManager : MonoBehaviour
     public float progressFadeOutDelay = 0.4f;     // temps d’attente après le remplissage
     public float progressFadeOutDuration = 0.6f;  // durée du lerp de disparition
 
-    
+    public static event Action<int, int> OnKosmoProgress;
     [Header("UI refs (6 chacun)")]
     public RawImage[] slots = new RawImage[6];
     public Button[] buttons = new Button[6];
