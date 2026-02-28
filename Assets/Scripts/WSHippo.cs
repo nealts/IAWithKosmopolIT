@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
@@ -20,13 +20,21 @@ public class WSHippo : MonoBehaviour
 
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
 
-    WSAlerts _alerts;
-    WSProgressBridge _progress;
+    [Header("Références")]
+    public EnergyAlertController energyController;
+
+    EnergyAlertController _energyController;
 
     void Start()
     {
-        _alerts = FindAnyObjectByType<WSAlerts>();
-        _progress = FindAnyObjectByType<WSProgressBridge>();
+        _energyController = energyController
+                            ? energyController
+                            : FindAnyObjectByType<EnergyAlertController>();
+
+        if (!_energyController)
+            Debug.LogError("[WS-Hippo] EnergyAlertController introuvable ! Assigne-le dans l'Inspector.");
+        else
+            Debug.Log($"[WS-Hippo] EnergyAlertController trouvé : {_energyController.gameObject.name}");
 
         if (WSConnectionsHub.Instance == null)
         {
@@ -89,35 +97,57 @@ public class WSHippo : MonoBehaviour
         while (_ws != null && _ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
         {
             var ms = new System.IO.MemoryStream();
-            WebSocketReceiveResult res;
-
-            do
+            try
             {
-                res = await _ws.ReceiveAsync(buf, _cts.Token);
-                ms.Write(buf.Array, buf.Offset, res.Count);
-            }
-            while (!res.EndOfMessage);
-
-            var msg = Encoding.UTF8.GetString(ms.ToArray()).Trim().ToLowerInvariant();
-            Debug.LogWarning("[WS-Hippo] " + msg);
-
-            if (msg == "hippofull")
-            {
-                _main.Enqueue(() => _alerts?.TriggerHippoFull());
-            }
-            if (msg == "alertehippo")
-            {
-                _main.Enqueue(() =>
+                WebSocketReceiveResult res;
+                do
                 {
-                    if (_progress != null && _progress.animator != null)
+                    res = await _ws.ReceiveAsync(buf, _cts.Token);
+                    if (res.MessageType == WebSocketMessageType.Close)
                     {
-                        _progress.animator.SetPercent(0f);
+                        await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", _cts.Token);
+                        break;
                     }
-                });
-            }
+                    ms.Write(buf.Array, buf.Offset, res.Count);
+                }
+                while (!res.EndOfMessage);
 
-            ms.Dispose();
+                var msg = Encoding.UTF8.GetString(ms.ToArray()).Trim().ToLowerInvariant();
+                Debug.Log("[WS-Hippo] reçu: " + msg);
+
+                switch (msg)
+                {
+                    case "startenergy":
+                        _main.Enqueue(() => _energyController?.StartEnergySequence());
+                        break;
+
+                    case "alertehippo":
+                        _main.Enqueue(() => _energyController?.GM_AlerteHippo());
+                        break;
+
+                    case "hippofull":
+                        _main.Enqueue(() => _energyController?.GM_HippoFull());
+                        break;
+
+                    case "grignotage":
+                        _main.Enqueue(() => _energyController?.GM_Grignotage());
+                        break;
+
+                    default:
+                        Debug.Log("[WS-Hippo] message inconnu: " + msg);
+                        break;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[WS-Hippo] Recv error: " + e.Message);
+                break;
+            }
+            finally { ms.Dispose(); }
         }
+
+        if (!_closing && autoReconnect)
+            _main.Enqueue(() => Invoke(nameof(Connect), reconnectDelaySec));
     }
 
     async Task CloseWS()

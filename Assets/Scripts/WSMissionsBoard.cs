@@ -19,7 +19,11 @@ public class WSMissionsBoard : MonoBehaviour
     [Header("Intégration alerts")]
     public WSAlerts alerts;
 
-    bool _hippoTriggeredOnce = false;
+    [Header("Activation du module missions")]
+    [Tooltip("Passer à true pour démarrer l'affichage des missions")]
+    public bool enableMissionModule = false;
+    bool _prevEnableMissionModule = false;
+
     bool _jumanjiTriggered = false;
     bool _jumanji1Triggered = false;
     bool _jumanji2Triggered = false;
@@ -52,9 +56,6 @@ public class WSMissionsBoard : MonoBehaviour
 
     bool _missionsUnlocked = false;
 
-    // Conditions pour débloquer les missions de Phase 1
-    bool _kosmoCompleted = false;
-    bool _hippoAlertTriggered = false;
     public static event System.Action Jumanji1Triggered;
     public static event System.Action Jumanji2Triggered;
 
@@ -188,6 +189,11 @@ public class WSMissionsBoard : MonoBehaviour
     void Update()
     {
         while (_main.TryDequeue(out var a)) a?.Invoke();
+
+        // Detection enableMissionModule false -> true (Inspector ou code)
+        if (enableMissionModule && !_prevEnableMissionModule)
+            UnlockMissions();
+        _prevEnableMissionModule = enableMissionModule;
     }
 
     void OnApplicationQuit() => _ = CloseAllWS();
@@ -277,9 +283,6 @@ public class WSMissionsBoard : MonoBehaviour
 
         // On ne veut ça qu'en Phase 1
         if (_currentPhase != 0) return;
-
-        // On veut que l'alerte Hippo ait été déclenchée au moins une fois
-        if (!_hippoTriggeredOnce) return;
 
         // "Pool de missions vide" = aucune mission active ni en queue
         if (_active.Count > 0) return;
@@ -669,6 +672,53 @@ public class WSMissionsBoard : MonoBehaviour
                 return;
             }
         }
+
+        // ---------- Commandes GM ----------
+        if (lower == "jumanji1")
+        {
+            _main.Enqueue(() => GM_ForceJumanji1());
+            return;
+        }
+    }
+
+    // ---------- GM ----------
+
+    void GM_ForceJumanji1()
+    {
+        if (logMessages) Debug.Log("[GM] ForceJumanji1 → transfert missions P1 restantes en P2 + alerte Jumanji1");
+
+        // Marque les missions Phase 1 actives non terminées comme Done
+        foreach (var r in _rt.Values)
+        {
+            if (r.run == RunState.Done) continue;
+            if (!r.active) continue;          // ignore les missions désactivées
+            if (r.phase != 0) continue;       // ignore les missions Phase 2
+
+            r.run = RunState.Done;
+            if (_done.Contains(r.id)) _done.Remove(r.id);
+            _done.AddFirst(r.id);
+        }
+
+        // Tronque à MaxDone
+        while (_done.Count > MaxDone) _done.RemoveLast();
+
+        // Vide les slots actifs et la queue
+        _active.Clear();
+        _queue.Clear();
+
+        // Marque jumanji1 comme déclenché pour éviter un double déclenchement auto
+        _jumanjiTriggered = true;
+        _jumanji1Triggered = true;
+
+        // Déclenche l'alerte visuelle
+        var alertTarget = alerts ? alerts : wsAlerts;
+        if (alertTarget) alertTarget.HandleMessage("jumanji1");
+        else Debug.LogWarning("[GM] Aucun WSAlerts assigné pour Jumanji1 !");
+
+        // Notifie l'extérieur (PhaseDebugUI etc.)
+        Jumanji1Triggered?.Invoke();
+
+        UpdateUI();
     }
 
     // ---------- Engine ----------
@@ -837,8 +887,6 @@ public class WSMissionsBoard : MonoBehaviour
     }
     void OnEnable()
     {
-        KosmoGameManager.GameCompleted += OnFlagsGameCompleted;
-        EnergyAlertController.HippoAlertTriggered += OnHippoAlertTriggered;
         WSAlerts.StopCommandReceived += OnStopCommandReceived;
         if (WSConnectionsHub.Instance != null)
             WSConnectionsHub.Instance.OnConfigChanged += HandleHubConfigChanged;
@@ -848,72 +896,28 @@ public class WSMissionsBoard : MonoBehaviour
 
     void OnDisable()
     {
-        KosmoGameManager.GameCompleted -= OnFlagsGameCompleted;
-        EnergyAlertController.HippoAlertTriggered -= OnHippoAlertTriggered;
         WSAlerts.StopCommandReceived -= OnStopCommandReceived;
         if (WSConnectionsHub.Instance != null)
             WSConnectionsHub.Instance.OnConfigChanged -= HandleHubConfigChanged;
 
     }
 
-    void OnFlagsGameCompleted()
-    {
-        _kosmoCompleted = true;
-
-        if (logMessages)
-            Debug.Log("[Missions] Kosmo complété (4/4).");
-
-        // 🔥 Envoi vers Node-RED sur topic kosmo
-        FindAnyObjectByType<KosmoNodeRedBridge>()?.SendKosmoRingEnd();
-
-        TryUnlockPhase1Missions();
-    }
-
-    void OnHippoAlertTriggered()
-    {
-        // On a déjà eu au moins une alerte Hippo
-        _hippoAlertTriggered = true;
-        if (logMessages) Debug.Log("[Missions] Alerte Hippo déclenchée.");
-        // (on ne débloque pas encore ici, il faut attendre le stopAlerte à 100%)
-    }
-
     void OnStopCommandReceived()
     {
-        // 1) Tant que les missions ne sont pas débloquées,
-        //    ce stop correspond à "fin Hippo → Phase 1"
-        if (!_missionsUnlocked)
-        {
-            TryUnlockPhase1Missions();
-            return;
-        }
-
-        // 2) À partir du moment où les missions sont débloquées,
-        //    si on est encore en Phase 1 et que le pool est vide au moment du stopAlerte,
-        //    on considère que c'est la fin de Jumanji1 => on passe en Phase 2.
+        // Si les missions sont débloquées, en Phase 1 et le pool est vide → passage en Phase 2
         if (_missionsUnlocked && _currentPhase == 0)
         {
             bool poolVide = (_active.Count == 0 && _queue.Count == 0);
             if (poolVide)
             {
                 Debug.Log("[Missions] stopAlerte avec pool Phase 1 vide → passage en Phase 2");
-                BeginPhase(1); // 1 = phase 2
+                BeginPhase(1);
             }
             else
             {
                 Debug.Log("[Missions] stopAlerte reçu mais pool Phase 1 NON vide → ignoré pour Phase 2");
             }
         }
-    }
-
-    void TryUnlockPhase1Missions()
-    {
-        if (_missionsUnlocked) return;
-        if (!_kosmoCompleted) return;
-        if (!_hippoAlertTriggered) return;
-        if (_currentPhase != 0) return;
-
-        Debug.Log("[Missions] Déblocage des missions de Phase 1 (conditions remplies).");
-        UnlockMissions();
     }
 
     List<string> VisibleActiveSnapshot()

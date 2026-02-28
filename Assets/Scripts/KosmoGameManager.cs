@@ -90,7 +90,7 @@ public class KosmoGameManager : MonoBehaviour
     void Awake()
     {
         _bridge = FindAnyObjectByType<KosmoNodeRedBridge>();
-        
+
         EnsureSeries();
         if (dna2D) dna2D.SetActive(false);
         // branchement des boutons
@@ -260,6 +260,14 @@ public class KosmoGameManager : MonoBehaviour
         }
         else
         {
+            // Si le jeu est terminé, on ne cherche plus de nouvelle série
+            if (_completionNotified)
+            {
+                SetSlotsVisible(false);
+                Debug.Log("[Kosmo] Jeu terminé, plus de nouvelle série.");
+                yield break;
+            }
+
             _readyForQueuedSwitch = true;
             SetSlotsVisible(false);
             Debug.Log("[Kosmo] Waiting for next Son...");
