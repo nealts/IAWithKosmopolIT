@@ -39,6 +39,10 @@ public class WSMissionsBoard : MonoBehaviour
     [SerializeField] private WSChannel iaChannel = WSChannel.Alerts;
     private string wsUrlIa;
 
+    [Header("WebSocket – Calibration (validation codes)")]
+    [SerializeField] private WSChannel calibChannel = WSChannel.Calibration;
+    private string wsUrlCalib;
+
     [Header("UI - Réparations en cours (4 slots max dans la scène)")]
     public TextMeshProUGUI[] ongoingSlots = new TextMeshProUGUI[4];
 
@@ -89,6 +93,10 @@ public class WSMissionsBoard : MonoBehaviour
     CancellationTokenSource _ctsIa;
     Task _recvTaskIa;
 
+    ClientWebSocket _wsCalib;
+    CancellationTokenSource _ctsCalib;
+    Task _recvTaskCalib;
+
     bool _closing;
     readonly ConcurrentQueue<Action> _main = new ConcurrentQueue<Action>();
 
@@ -115,6 +123,7 @@ public class WSMissionsBoard : MonoBehaviour
         RefreshWsUrls();
         ConnectCmd();
         ConnectIa();
+        ConnectCalib();
     }
 
     public void UnlockMissions()
@@ -168,6 +177,7 @@ public class WSMissionsBoard : MonoBehaviour
 
         wsUrl = hub.GetUrl(channel);
         wsUrlIa = hub.GetUrl(iaChannel);
+        wsUrlCalib = hub.GetUrl(calibChannel);
     }
 
     async void HandleHubConfigChanged()
@@ -184,6 +194,7 @@ public class WSMissionsBoard : MonoBehaviour
 
         ConnectCmd();
         ConnectIa();
+        ConnectCalib();
     }
 
     void Update()
@@ -480,6 +491,99 @@ public class WSMissionsBoard : MonoBehaviour
         if (autoReconnect && !_closing) _main.Enqueue(() => Invoke(nameof(ConnectIa), reconnectDelaySec));
     }
 
+    // ---------- WebSocket (Calibration) ----------
+    async void ConnectCalib()
+    {
+        await CloseWS(_wsCalib, _ctsCalib, _recvTaskCalib);
+        _wsCalib = null; _ctsCalib = null; _recvTaskCalib = null;
+
+        _wsCalib = new ClientWebSocket();
+        _ctsCalib = new CancellationTokenSource();
+        try
+        {
+            if (logMessages) Debug.Log("[WS-calib] Connecting " + wsUrlCalib);
+            await _wsCalib.ConnectAsync(new Uri(wsUrlCalib), _ctsCalib.Token);
+            if (logMessages) Debug.Log("[WS-calib] Connected");
+            _recvTaskCalib = Task.Run(RecvLoopCalib);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[WS-calib] Connect failed: " + e.Message);
+            if (autoReconnect) Invoke(nameof(ConnectCalib), reconnectDelaySec);
+        }
+    }
+
+    async Task RecvLoopCalib()
+    {
+        var buf = new ArraySegment<byte>(new byte[256]);
+        while (_wsCalib != null && _wsCalib.State == WebSocketState.Open && !_ctsCalib.IsCancellationRequested)
+        {
+            var ms = new System.IO.MemoryStream();
+            try
+            {
+                WebSocketReceiveResult res;
+                do
+                {
+                    res = await _wsCalib.ReceiveAsync(buf, _ctsCalib.Token);
+                    if (res.MessageType == WebSocketMessageType.Close)
+                    {
+                        await _wsCalib.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", _ctsCalib.Token);
+                        break;
+                    }
+                    ms.Write(buf.Array, buf.Offset, res.Count);
+                }
+                while (!res.EndOfMessage);
+
+                var code = Encoding.UTF8.GetString(ms.ToArray()).Trim();
+                _main.Enqueue(() => HandleCalibrationCode(code));
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[WS-calib] Recv error: " + e.Message);
+                break;
+            }
+            finally { ms.Dispose(); }
+        }
+        if (autoReconnect && !_closing) _main.Enqueue(() => Invoke(nameof(ConnectCalib), reconnectDelaySec));
+    }
+
+    void HandleCalibrationCode(string code)
+    {
+        if (string.IsNullOrWhiteSpace(code)) return;
+
+        // Cherche une mission dont le code correspond
+        var match = missions.FirstOrDefault(m =>
+            !string.IsNullOrEmpty(m.code) &&
+            m.code.Trim() == code.Trim());
+
+        if (match == null)
+        {
+            Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Non");
+            return;
+        }
+
+        // La mission existe dans le catalogue — est-elle dans le pool actif ?
+        bool isActive = _active.Contains(match.id);
+        bool isInQueue = _queue.Contains(match.id);
+        bool isDone = _rt.TryGetValue(match.id, out var rt) && rt.run == RunState.Done;
+
+        if (isDone)
+        {
+            Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui ({match.title}) | Déjà effectuée");
+            return;
+        }
+
+        if (isActive)
+        {
+            Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui ({match.title}) | Dans le pool actif → VALIDÉE");
+            CompleteMission(match.id);
+        }
+        else
+        {
+            Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui mais pas encore dans le pool des missions actives ({match.title})");
+        }
+    }
+
     private async Task CloseWS(ClientWebSocket ws, CancellationTokenSource cts, Task recv)
     {
         try
@@ -508,6 +612,9 @@ public class WSMissionsBoard : MonoBehaviour
 
         await CloseWS(_wsIa, _ctsIa, _recvTaskIa);
         _wsIa = null; _ctsIa = null; _recvTaskIa = null;
+
+        await CloseWS(_wsCalib, _ctsCalib, _recvTaskCalib);
+        _wsCalib = null; _ctsCalib = null; _recvTaskCalib = null;
 
         _closing = false;
     }
@@ -1069,6 +1176,8 @@ public class WSMissionsBoard : MonoBehaviour
         public string startAlias;
         public int number = 0;
         public string outMessage;
+        [Tooltip("Code à 6 chiffres connu uniquement du GM. Les joueurs le découvrent en réussissant la mission.")]
+        public string code;         // ex: "050173"
 
         // 👇 les deux bool qui apparaissent dans le catalogue
         public bool actif = true;   // 1 = active, 0 = désactivée
@@ -1077,17 +1186,30 @@ public class WSMissionsBoard : MonoBehaviour
 
     public static MissionDef[] DefaultMissions()
     {
-        string[] names = {
-            "Qui est ce ?","Crime City","Mystère de Pékin","Hippo Glouton","Kosmopolite",
-            "Dr Maboul","Loup Garou de Thiercelieux","Time line","Bomb busters","Photo Party",
-            "Mission 11","Mission 12","Mission 13","Mission 14","Mission 15",
-            "Mission 16","Mission 17","Mission 18","Mission 19","Mission 20"
-        };
-        var list = new List<MissionDef>();
-        for (int i = 0; i < 20; i++)
+        // (title, code, phase)  phase false=0, true=1
+        // Codes : BLANC+JAUNE+VERT+BLEU+ROUGE+NOIR
+        var data = new (string title, string code, bool phase)[]
         {
+            // --- Phase 0 (6 missions) ---
+            ("Turing Machine",            "851927", false),
+            ("Canon Noir",                "735847", false),
+            ("Labyrinthe Magique",         "743629", false),
+            ("Trivial Pursuit",           "831759", false),
+            ("Behind Elixir",             "817435", false),
+            ("7 Wonders",                 "514263", false),
+            // --- Phase 1 (5 missions) ---
+            ("Cluedo",                    "",       true),
+            ("Bazar Bizarre",             "424562", true),
+            ("Il etait une fois",         "",       true),
+            ("Scrabble",                  "",       true),
+            ("Photo Party",               "",       true),
+        };
+
+        var list = new List<MissionDef>();
+        for (int i = 0; i < data.Length; i++)
+        {
+            var (title, code, phase) = data[i];
             var id = "m" + (i + 1).ToString("00");
-            var title = names[i];
             var num = i + 1;
             list.Add(new MissionDef
             {
@@ -1095,7 +1217,10 @@ public class WSMissionsBoard : MonoBehaviour
                 title = title,
                 startAlias = Slug(title),
                 number = num,
-                outMessage = $"Mission {num.ToString("D6")}"
+                outMessage = $"Mission {num.ToString("D6")}",
+                code = code,
+                actif = true,
+                phase = phase
             });
         }
         return list.ToArray();

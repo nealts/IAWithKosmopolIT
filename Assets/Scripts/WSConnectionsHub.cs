@@ -1,4 +1,4 @@
-using System;
+ï»¿using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -8,7 +8,8 @@ public enum WSChannel
     Kosmo,
     Progress,
     Alerts,
-    Hippo
+    Hippo,
+    Calibration
 }
 
 [DisallowMultipleComponent]
@@ -31,6 +32,7 @@ public class WSConnectionsHub : MonoBehaviour
     [SerializeField] private string progressTopic = "dna";
     [SerializeField] private string alertsTopic = "ia";
     [SerializeField] private string hippoTopic = "hippo";
+    [SerializeField] private string calibrationTopic = "calibration";
 
     public event Action OnConfigChanged;
 
@@ -53,7 +55,8 @@ public class WSConnectionsHub : MonoBehaviour
             { WSChannel.Kosmo,    () => kosmoTopic },
             { WSChannel.Progress, () => progressTopic },
             { WSChannel.Alerts,   () => alertsTopic },
-            { WSChannel.Hippo, () => hippoTopic },
+            { WSChannel.Hippo,       () => hippoTopic },
+            { WSChannel.Calibration, () => calibrationTopic },
         };
     }
 
@@ -71,7 +74,7 @@ public class WSConnectionsHub : MonoBehaviour
 #if UNITY_EDITOR
     private void OnValidate()
     {
-        // Permet de notifier en play mode quand tu modifies l’IP/topic dans l’inspector
+        // Permet de notifier en play mode quand tu modifies lÂ’IP/topic dans lÂ’inspector
         if (Application.isPlaying)
             OnConfigChanged?.Invoke();
     }
