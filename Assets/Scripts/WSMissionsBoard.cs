@@ -7,8 +7,10 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections;
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 
 public class WSMissionsBoard : MonoBehaviour
 {
@@ -54,6 +56,12 @@ public class WSMissionsBoard : MonoBehaviour
 
     [Header("Catalogue de missions")]
     public MissionDef[] missions = DefaultMissions();
+
+    [Header("Feedback visuel – validation code")]
+    [Tooltip("Image UI centrée à l'écran pour afficher la coche/croix")]
+    public Image codeFeedbackImage;
+    public Sprite spriteCodeValid;
+    public Sprite spriteCodeInvalid;
 
     [Header("Debug")]
     public bool logMessages = true;
@@ -559,6 +567,7 @@ public class WSMissionsBoard : MonoBehaviour
         if (match == null)
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Non");
+            ShowCodeFeedback(false);
             return;
         }
 
@@ -570,18 +579,38 @@ public class WSMissionsBoard : MonoBehaviour
         if (isDone)
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui ({match.title}) | Déjà effectuée");
+            ShowCodeFeedback(false);
             return;
         }
 
         if (isActive)
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui ({match.title}) | Dans le pool actif → VALIDÉE");
+            ShowCodeFeedback(true);
             CompleteMission(match.id);
         }
         else
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui mais pas encore dans le pool des missions actives ({match.title})");
+            ShowCodeFeedback(false);
         }
+    }
+
+    void ShowCodeFeedback(bool success)
+    {
+        if (codeFeedbackImage == null) return;
+        var sprite = success ? spriteCodeValid : spriteCodeInvalid;
+        if (sprite == null) return;
+        StopCoroutine(nameof(CodeFeedbackRoutine));
+        StartCoroutine(nameof(CodeFeedbackRoutine), sprite);
+    }
+
+    IEnumerator CodeFeedbackRoutine(Sprite sprite)
+    {
+        codeFeedbackImage.sprite = sprite;
+        codeFeedbackImage.gameObject.SetActive(true);
+        yield return new WaitForSeconds(2f);
+        codeFeedbackImage.gameObject.SetActive(false);
     }
 
     private async Task CloseWS(ClientWebSocket ws, CancellationTokenSource cts, Task recv)
