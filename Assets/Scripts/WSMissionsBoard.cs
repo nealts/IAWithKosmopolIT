@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 
 public class WSMissionsBoard : MonoBehaviour
 {
@@ -57,6 +58,18 @@ public class WSMissionsBoard : MonoBehaviour
 
     [Header("Debug")]
     public bool logMessages = true;
+
+    [Header("Feedback Calibration")]
+    [Tooltip("Sprite coche verte (même que Kosmo)")]
+    public Sprite winSprite;
+    [Tooltip("Sprite croix rouge (même que Kosmo)")]
+    public Sprite failSprite;
+    [Tooltip("Parent UI où apparaît le feedback (position fixe)")]
+    public RectTransform feedbackParent;
+    [Tooltip("Durée d'affichage du feedback en secondes")]
+    public float feedbackDuration = 2.5f;
+
+    Coroutine _feedbackCo;
 
     bool _missionsUnlocked = false;
 
@@ -559,29 +572,89 @@ public class WSMissionsBoard : MonoBehaviour
         if (match == null)
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Non");
+            ShowFeedback(false);
             return;
         }
 
-        // La mission existe dans le catalogue — est-elle dans le pool actif ?
         bool isActive = _active.Contains(match.id);
-        bool isInQueue = _queue.Contains(match.id);
         bool isDone = _rt.TryGetValue(match.id, out var rt) && rt.run == RunState.Done;
 
         if (isDone)
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui ({match.title}) | Déjà effectuée");
+            ShowFeedback(false);
             return;
         }
 
         if (isActive)
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui ({match.title}) | Dans le pool actif → VALIDÉE");
+            ShowFeedback(true);
             CompleteMission(match.id);
+            // Envoi "livraison" sur le canal IA
+            _ = SendIaAsync("livraison");
         }
         else
         {
             Debug.Log($"[Calibration] Code reçu : {code} | Mission compatible : Oui mais pas encore dans le pool des missions actives ({match.title})");
+            ShowFeedback(false);
         }
+    }
+
+    void ShowFeedback(bool success)
+    {
+        if (!feedbackParent) return;
+        var sprite = success ? winSprite : failSprite;
+        if (!sprite)
+        {
+            // Fallback : tente de charger depuis Resources (comme KosmoGameManager)
+            sprite = Resources.Load<Sprite>(success ? "Images/CocheVerte" : "Images/CroixRouge");
+        }
+        if (!sprite) { Debug.LogWarning("[Calibration] Sprite feedback manquant."); return; }
+
+        if (_feedbackCo != null) { StopCoroutine(_feedbackCo); _feedbackCo = null; }
+        // Nettoie les anciens feedbacks
+        foreach (Transform child in feedbackParent) Destroy(child.gameObject);
+
+        _feedbackCo = StartCoroutine(FeedbackRoutine(sprite));
+    }
+
+    System.Collections.IEnumerator FeedbackRoutine(Sprite sprite)
+    {
+        // Crée l'image
+        var go = new GameObject("CalibFeedback", typeof(RectTransform), typeof(CanvasRenderer), typeof(Image));
+        var rt = go.GetComponent<RectTransform>();
+        var img = go.GetComponent<Image>();
+
+        go.transform.SetParent(feedbackParent, false);
+        rt.anchorMin = rt.anchorMax = new Vector2(0.5f, 0.5f);
+        rt.pivot = new Vector2(0.5f, 0.5f);
+        rt.anchoredPosition = Vector2.zero;
+        rt.sizeDelta = new Vector2(200f, 200f);
+
+        img.sprite = sprite;
+        img.color = Color.white;
+        img.preserveAspect = true;
+        img.raycastTarget = false;
+
+        // Ajoute un CanvasGroup pour le fade
+        var cg = go.AddComponent<CanvasGroup>();
+        cg.alpha = 1f;
+
+        // Attend puis fade out
+        yield return new UnityEngine.WaitForSeconds(feedbackDuration * 0.7f);
+
+        float elapsed = 0f;
+        float fadeDur = feedbackDuration * 0.3f;
+        while (elapsed < fadeDur)
+        {
+            elapsed += Time.deltaTime;
+            cg.alpha = Mathf.Lerp(1f, 0f, elapsed / fadeDur);
+            yield return null;
+        }
+
+        Destroy(go);
+        _feedbackCo = null;
     }
 
     private async Task CloseWS(ClientWebSocket ws, CancellationTokenSource cts, Task recv)
@@ -632,6 +705,21 @@ public class WSMissionsBoard : MonoBehaviour
             else if (logMessages) Debug.LogWarning("[WS-out] skipped (not connected): " + text);
         }
         catch (Exception e) { Debug.LogWarning("[WS-out] send failed: " + e.Message); }
+    }
+
+    async Task SendIaAsync(string text)
+    {
+        try
+        {
+            if (_wsIa != null && _wsIa.State == WebSocketState.Open)
+            {
+                var seg = new ArraySegment<byte>(Encoding.UTF8.GetBytes(text));
+                await _wsIa.SendAsync(seg, WebSocketMessageType.Text, true, CancellationToken.None);
+                if (logMessages) Debug.Log("[WS-ia-out] => " + text);
+            }
+            else if (logMessages) Debug.LogWarning("[WS-ia-out] skipped (not connected): " + text);
+        }
+        catch (Exception e) { Debug.LogWarning("[WS-ia-out] send failed: " + e.Message); }
     }
 
     [Serializable] class Cmd { public string cmd; public string mission; public string id; }
